@@ -1,0 +1,17 @@
+[build]
+  command = "npm run build"
+  publish = "dist"
+
+[build.environment]
+  NODE_VERSION = "20"
+
+# SPA: la app usa ruteo por hash (#/pedidos, #/produccion, etc.), así que en
+# realidad Netlify siempre sirve "/" y el navegador resuelve la sección con
+# el hash del lado del cliente. Esta redirección queda como red de
+# seguridad para cualquier acceso directo a una ruta (ej. si en el futuro se
+# agrega alguna ruta sin hash, o para evitar 404 en accesos raros), sin
+# afectar la navegación actual.
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
