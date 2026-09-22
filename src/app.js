@@ -2051,7 +2051,8 @@ function viewProveedorDetail(id) {
   const incidents = state.incidents.filter((i) => (i.relatedType === "purchase_order" && pos.some((p) => p.id === i.relatedId)) || (i.relatedType === "supplier" && i.relatedId === id));
   return `
   <div class="detail-view">
-    <div class="detail-head"><div><a href="#/ubicaciones" class="back-link">← Ubicaciones</a><h2>${esc(s.name)}</h2><div class="detail-sub">${esc(loc ? loc.city + ", " + loc.province : "")}</div></div></div>
+    <div class="detail-head"><div><a href="#/ubicaciones" class="back-link">← Ubicaciones</a><h2>${esc(s.name)}</h2><div class="detail-sub">${esc(loc ? loc.city + ", " + loc.province : "")}</div></div>
+    ${loc ? `<div class="detail-actions"><button class="btn btn-ghost" data-action="open-modal" data-modal="location" data-id="${loc.id}">Editar</button></div>` : ""}</div>
     <div class="detail-grid">
       <div class="panel">
         <div class="panel-head"><h3>Datos de contacto</h3></div>
@@ -2190,11 +2191,13 @@ function viewUbicaciones() {
       return `<div class="loc-group"><div class="loc-group-title">${LOCATION_TYPES[ty].icon} ${LOCATION_TYPES[ty].label}s</div>
         <div class="card-grid">${items.map((l) => {
           const sup = state.suppliers.find(s=>s.locationId===l.id);
-          const href = sup ? `#/proveedores/${sup.id}` : "#/ubicaciones";
-          return `<a href="${href}" class="entity-card">
-            <div class="entity-card-icon">${LOCATION_TYPES[ty].icon}</div>
-            <div><div class="entity-card-title">${esc(l.name)}</div><div class="entity-card-sub">${esc(l.address)}, ${esc(l.city)}</div>${l.phone ? `<div class="entity-card-meta">${esc(l.phone)}</div>` : ""}</div>
-          </a>`;
+          const href = sup ? `#/proveedores/${sup.id}` : null;
+          const inner = `<div class="entity-card-icon">${LOCATION_TYPES[ty].icon}</div>
+            <div style="flex:1;min-width:0"><div class="entity-card-title">${esc(l.name)}</div><div class="entity-card-sub">${esc(l.address)}, ${esc(l.city)}</div>${l.phone ? `<div class="entity-card-meta">${esc(l.phone)}</div>` : ""}</div>`;
+          return `<div class="entity-card">
+            ${href ? `<a href="${href}" style="display:flex;gap:12px;align-items:center;flex:1;min-width:0;color:inherit;text-decoration:none">${inner}</a>` : `<div style="display:flex;gap:12px;align-items:center;flex:1;min-width:0">${inner}</div>`}
+            <button class="btn btn-secondary btn-sm" data-action="open-modal" data-modal="location" data-id="${l.id}">Editar</button>
+          </div>`;
         }).join("")}</div></div>`;
     }).join("")}
     ${(() => { ubicacionesMapMarkers = state.locations.map((l) => ({ kind: l.type, loc: l, label: l.name })); return ""; })()}
@@ -4346,29 +4349,34 @@ function openModal(kind, opts = {}) {
       <div class="form-actions"><button type="button" class="btn btn-ghost" data-action="close-modal">Cancelar</button><button type="submit" class="btn btn-primary">${t ? "Guardar cambios" : "Crear"}</button></div>
     </form>`;
   } else if (kind === "location") {
-    body = `<form data-form="location-quick">
-      <h3>Nueva ubicación</h3>
+    const l = opts.id ? getById("locations", opts.id) : null;
+    const linkedSupplier = l ? state.suppliers.find((s) => s.locationId === l.id) : null;
+    body = `<form data-form="location-quick" data-id="${l ? l.id : ""}">
+      <h3>${l ? "Editar ubicación" : "Nueva ubicación"}</h3>
       <div class="form-grid">
-        <label>Nombre<input class="input" name="name" required /></label>
-        <label>Tipo<select class="input" name="type">${Object.entries(LOCATION_TYPES).map(([k,v])=>`<option value="${k}">${v.label}</option>`).join("")}</select></label>
+        <label>Nombre<input class="input" name="name" required value="${esc(l?.name || "")}" /></label>
+        <label>Tipo<select class="input" name="type">${Object.entries(LOCATION_TYPES).map(([k,v])=>`<option value="${k}" ${l?.type===k?"selected":""}>${v.label}</option>`).join("")}</select></label>
         <label class="span2">Dirección
           <div class="addr-search-row">
-            <input class="input" name="address" id="loc-address" required placeholder="Ej: San Martín 850, Córdoba" />
+            <input class="input" name="address" id="loc-address" required placeholder="Ej: San Martín 850, Córdoba" value="${esc(l?.address || "")}" />
             <button type="button" class="btn btn-secondary btn-sm" data-action="geocode-address">📍 Buscar en el mapa</button>
           </div>
         </label>
-        <div class="span2" id="loc-picker-wrap" hidden>
+        <div class="span2" id="loc-picker-wrap" ${l?.lat && l?.lng ? "" : "hidden"}>
           <div id="mapa-picker" class="leaflet-box" style="height:200px"></div>
           <div class="hint" style="margin-top:6px">Arrastrá el marcador (o tocá el mapa) para ajustar el punto exacto.</div>
         </div>
-        <input type="hidden" name="lat" id="loc-lat" />
-        <input type="hidden" name="lng" id="loc-lng" />
-        <label>Ciudad<input class="input" name="city" /></label>
-        <label>Provincia<input class="input" name="province" /></label>
-        <label>Contacto<input class="input" name="contact" /></label>
-        <label>Teléfono<input class="input" name="phone" /></label>
+        <input type="hidden" name="lat" id="loc-lat" value="${l?.lat ?? ""}" />
+        <input type="hidden" name="lng" id="loc-lng" value="${l?.lng ?? ""}" />
+        <label>Ciudad<input class="input" name="city" value="${esc(l?.city || "")}" /></label>
+        <label>Provincia<input class="input" name="province" value="${esc(l?.province || "")}" /></label>
+        <label>Contacto<input class="input" name="contact" value="${esc(l?.contact || linkedSupplier?.contact || "")}" /></label>
+        <label>Teléfono<input class="input" name="phone" value="${esc(l?.phone || linkedSupplier?.phone || "")}" /></label>
+        ${linkedSupplier ? `
+        <label class="span2">Email (proveedor)<input class="input" type="email" name="email" value="${esc(linkedSupplier.email || "")}" /></label>
+        <label class="span2">Observaciones (proveedor)<textarea class="input" name="notes" rows="2">${esc(linkedSupplier.notes || "")}</textarea></label>` : ""}
       </div>
-      <div class="form-actions"><button type="button" class="btn btn-ghost" data-action="close-modal">Cancelar</button><button type="submit" class="btn btn-primary">Crear</button></div>
+      <div class="form-actions"><button type="button" class="btn btn-ghost" data-action="close-modal">Cancelar</button><button type="submit" class="btn btn-primary">${l ? "Guardar cambios" : "Crear"}</button></div>
     </form>`;
   } else if (kind === "task") {
     body = `<form data-form="task-quick">
@@ -4736,6 +4744,12 @@ function openModal(kind, opts = {}) {
   host.classList.remove("hidden");
   requestAnimationFrame(() => host.querySelector(".modal-backdrop")?.classList.add("show"));
   if (kind === "streetview") openStreetView("sv-pano", opts.lat, opts.lng);
+  if (kind === "location" && opts.id) {
+    const editedLoc = getById("locations", opts.id);
+    if (editedLoc?.lat && editedLoc?.lng) {
+      mountPickerMap("mapa-picker", editedLoc.lat, editedLoc.lng, (nlat, nlng) => { $("#loc-lat").value = nlat; $("#loc-lng").value = nlng; });
+    }
+  }
 }
 
 /** Abre el modal de Street View real para un punto — nunca una imagen
@@ -4838,17 +4852,35 @@ async function handleFormSubmit(form) {
     }
     closeModal(); toast(msg); renderApp();
   } else if (kind === "location-quick") {
+    const editing = !!form.dataset.id;
+    const existing = editing ? getById("locations", form.dataset.id) : null;
     const latVal = val("lat"), lngVal = val("lng");
-    const rec = { id: uid("loc"), type: val("type") || "otro", name: val("name"), address: val("address"), city: val("city"), province: val("province"), contact: val("contact"), phone: val("phone"), lat: latVal ? parseFloat(latVal) : null, lng: lngVal ? parseFloat(lngVal) : null };
+    const rec = {
+      ...(existing || {}),
+      id: form.dataset.id || uid("loc"),
+      type: val("type") || "otro", name: val("name"), address: val("address"), city: val("city"), province: val("province"),
+      contact: val("contact"), phone: val("phone"),
+      lat: latVal ? parseFloat(latVal) : null, lng: lngVal ? parseFloat(lngVal) : null,
+    };
     await persist("locations", rec);
-    // Un cliente o proveedor recién ubicado queda disponible de inmediato en los
-    // formularios de pedidos / OC, sin tener que cargarlo dos veces.
+    // Un cliente o proveedor recién ubicado (o editado) queda disponible/actualizado
+    // de inmediato en los formularios de pedidos / OC, sin tener que cargarlo dos veces.
+    const linkedCustomer = editing ? state.customers.find((c) => c.locationId === rec.id) : null;
+    const linkedSupplier = editing ? state.suppliers.find((s) => s.locationId === rec.id) : null;
     if (rec.type === "cliente") {
-      await persist("customers", { id: uid("cus"), name: rec.name, phone: rec.phone || "", locationId: rec.id, notes: "" });
+      if (linkedCustomer) {
+        await persist("customers", { ...linkedCustomer, name: rec.name, phone: rec.phone || "" });
+      } else {
+        await persist("customers", { id: uid("cus"), name: rec.name, phone: rec.phone || "", locationId: rec.id, notes: "" });
+      }
     } else if (rec.type === "proveedor") {
-      await persist("suppliers", { id: uid("sup"), name: rec.name, locationId: rec.id, contact: rec.contact || "", phone: rec.phone || "", email: "", notes: "", usualTransports: [] });
+      if (linkedSupplier) {
+        await persist("suppliers", { ...linkedSupplier, name: rec.name, contact: rec.contact || "", phone: rec.phone || "", email: val("email") || "", notes: val("notes") || "" });
+      } else {
+        await persist("suppliers", { id: uid("sup"), name: rec.name, locationId: rec.id, contact: rec.contact || "", phone: rec.phone || "", email: val("email") || "", notes: val("notes") || "", usualTransports: [] });
+      }
     }
-    closeModal(); toast("Ubicación creada"); renderApp();
+    closeModal(); toast(editing ? "Ubicación actualizada" : "Ubicación creada"); renderApp();
   } else if (kind === "task-quick") {
     const rec = { id: uid("tsk"), title: val("title"), date: val("date"), time: val("time"), priority: val("priority"), category: val("category") || "General", status: "pendiente", notes: val("notes") };
     await persist("tasks", rec);
