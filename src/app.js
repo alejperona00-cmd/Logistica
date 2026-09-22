@@ -697,6 +697,11 @@ function viewDashboard() {
             </div>
           </a>`).join("")}</div>` : emptyState("🕒", "Sin actividad", "Los cambios de estado aparecerán acá.")}
       </div>
+
+      <div class="panel">
+        <div class="panel-head"><h3>Top clientes</h3><a href="#/reportes" class="link-more">Ver ranking completo →</a></div>
+        ${clientRankingHTML(clientRankingData(state.orders, 5))}
+      </div>
     </div>
   </div>`;
 }
@@ -3591,6 +3596,33 @@ function donut(segments, size=120) {
   }).join("");
   return `<svg viewBox="0 0 42 42" style="width:${size}px;height:${size}px;transform:rotate(-90deg)">${circles}</svg>`;
 }
+/** Ranking de clientes por cantidad de despachos (pedidos), sobre el listado
+ * de pedidos que se le pase — no asume un período: quien llama decide si es
+ * todo el historial o un rango filtrado. Sólo cuenta pedidos con customerId
+ * real (no inventa clientes para pedidos sueltos sin cliente asignado). */
+function clientRankingData(orders, limit = 15) {
+  const counts = {};
+  orders.forEach((o) => {
+    if (!o.customerId) return;
+    counts[o.customerId] = (counts[o.customerId] || 0) + 1;
+  });
+  const rows = Object.entries(counts).map(([customerId, count]) => {
+    const c = getById("customers", customerId);
+    if (!c) return null;
+    const loc = c.locationId ? getById("locations", c.locationId) : null;
+    const address = loc ? [loc.address, loc.city].filter(Boolean).join(", ") : "";
+    return { customer: c, count, address };
+  }).filter(Boolean);
+  rows.sort((a, b) => b.count - a.count);
+  return rows.slice(0, limit);
+}
+function clientRankingHTML(rows, opts = {}) {
+  if (!rows.length) return emptyState("🏢", "Sin despachos con cliente asignado", "Todavía no hay pedidos vinculados a un cliente en este período.");
+  return `<table class="mini-table"><thead><tr><th>#</th><th>Cliente</th><th>Despachos</th>${opts.showAddress ? "<th>Domicilio habitual</th>" : ""}</tr></thead><tbody>
+    ${rows.map((r, i) => `<tr><td>${i + 1}</td><td><a href="#/ubicaciones">${esc(r.customer.name)}</a></td><td><b>${r.count}</b></td>${opts.showAddress ? `<td>${esc(r.address || "—")}</td>` : ""}</tr>`).join("")}
+  </tbody></table>`;
+}
+
 function viewReportes() {
   const orders = state.orders, pos = state.purchase_orders, incs = state.incidents;
   const oStats = { total: orders.length, entregados: orders.filter(o=>o.status==="entregado").length, pendientes: orders.filter(o=>!["entregado","cancelado"].includes(o.status)).length, atrasados: orders.filter(o=>orderUrgency(o).key==="atrasada").length, camino: orders.filter(o=>o.status==="en_camino").length, incidencias: orders.filter(o=>o.status==="incidencia").length };
@@ -3627,6 +3659,10 @@ function viewReportes() {
       <div class="panel">
         <div class="panel-head"><h3>Incidencias por categoría</h3></div>
         ${svgBar(Object.entries(byCategory).map(([k,v])=>({label:catLabels[k]||k,value:v,color:"var(--accent)"})))}
+      </div>
+      <div class="panel span2">
+        <div class="panel-head"><h3>Top clientes por despachos</h3><span class="hint">Todo el historial</span></div>
+        ${clientRankingHTML(clientRankingData(orders, 15), { showAddress: true })}
       </div>
     </div>
   </div>`;
@@ -3876,6 +3912,7 @@ function gerenciaData(range) {
     },
     costos: { produccionDisponible, costoProduccion: produccionDisponible ? costoProduccion : null, costoPorCaja, mermaQty, mermaCount: movsMerma.length, devolucionQty, devolucionCount: movsDevolucion.length },
     productividad: { tiempoPrepProm, tiempoEntregaProm },
+    clientesTop: clientRankingData(ordersInRange, 8),
   };
 }
 
@@ -4062,6 +4099,10 @@ function gerenciaDistribucionHTML(data) {
             }).join("")}
           </tbody></table>`
         : gerenciaMissing("Sin entregas registradas en el período")}
+    </div>
+    <div class="panel span2">
+      <div class="panel-head"><h3>Top clientes por despachos</h3><span class="hint">${esc(data.range.label)}</span></div>
+      ${clientRankingHTML(data.clientesTop)}
     </div>
   </div>`;
 }
