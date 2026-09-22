@@ -22,14 +22,42 @@ export function fromDbRow(row) {
   return out;
 }
 
+/**
+ * Trae TODAS las filas de una tabla, paginando con .range() para evitar el
+ * límite por defecto de PostgREST/Supabase (1000 filas por request). Acumula
+ * páginas de PAGE_SIZE filas hasta que una página vuelve incompleta.
+ */
+const PAGE_SIZE = 1000;
+async function fetchAllRows(col) {
+  const rows = [];
+  let from = 0;
+  for (;;) {
+    const { data, error } = await supabase
+      .from(col)
+      .select("*")
+      .order("created_at", { ascending: true })
+      .range(from, from + PAGE_SIZE - 1);
+    if (error) throw error;
+    const page = data || [];
+    rows.push(...page);
+    if (page.length < PAGE_SIZE) break;
+    from += PAGE_SIZE;
+  }
+  return rows;
+}
+
 /** Carga todas las colecciones. Devuelve { locations: [...], orders: [...], ... } */
 export async function loadAll() {
   const result = {};
   await Promise.all(
     COLLECTIONS.map(async (col) => {
-      const { data, error } = await supabase.from(col).select("*").order("created_at", { ascending: true });
-      if (error) { console.error(`[db] error cargando ${col}:`, error.message); result[col] = []; return; }
-      result[col] = (data || []).map(fromDbRow);
+      try {
+        const data = await fetchAllRows(col);
+        result[col] = data.map(fromDbRow);
+      } catch (error) {
+        console.error(`[db] error cargando ${col}:`, error.message);
+        result[col] = [];
+      }
     })
   );
   return result;
