@@ -2697,14 +2697,14 @@ function xlsxCellStyle({ bg, font, bold } = {}) {
 function exportInventarioProductosExcel() {
   const q = inventarioSearch.trim().toLowerCase();
   const list = state.products
-    .filter((p) => !q || p.name.toLowerCase().includes(q) || invSupplierName(p.supplierId).toLowerCase().includes(q) || (p.sku || "").toLowerCase().includes(q) || (p.categoria || "").toLowerCase().includes(q))
+    .filter((p) => !q || p.name.toLowerCase().includes(q) || invSupplierName(p.supplierId).toLowerCase().includes(q) || (p.sku || "").toLowerCase().includes(q) || (p.categoria || "").toLowerCase().includes(q) || (p.marca || "").toLowerCase().includes(q))
     .sort((a, b) => a.name.localeCompare(b.name));
 
-  const headers = ["Producto", "SKU", "Categoría", "Proveedor", "Unidad", "Tamaño de paquete", "Stock total", "Estado de vencimiento", "Stock mínimo", "Stock óptimo", "Stock máximo", "Maneja lote", "Maneja vencimiento", "Días de alerta", "Notas"];
+  const headers = ["Producto", "Marca", "SKU", "Categoría", "Proveedor", "Unidad", "Tamaño de paquete", "Stock total", "Estado de vencimiento", "Stock mínimo", "Stock óptimo", "Stock máximo", "Maneja lote", "Maneja vencimiento", "Días de alerta", "Notas"];
   const aoa = [headers, ...list.map((p) => {
     const status = productWorstStatus(p.id);
     return [
-      p.name, p.sku || "", p.categoria || "", invSupplierName(p.supplierId), p.unit || "", p.packageSize ?? "",
+      p.name, p.marca || "", p.sku || "", p.categoria || "", invSupplierName(p.supplierId), p.unit || "", p.packageSize ?? "",
       productTotalQty(p.id), status.label, p.minQty ?? "", p.optimalQty ?? "", p.maxQty ?? "",
       p.manejaLote ? "Sí" : "No", p.manejaVencimiento ? "Sí" : "No", p.diasAlerta ?? "", p.notes || "",
     ];
@@ -2751,11 +2751,11 @@ function viewInventarioProductos() {
   }
   const q = inventarioSearch.trim().toLowerCase();
   const list = state.products
-    .filter((p) => !q || p.name.toLowerCase().includes(q) || invSupplierName(p.supplierId).toLowerCase().includes(q) || (p.sku || "").toLowerCase().includes(q) || (p.categoria || "").toLowerCase().includes(q))
+    .filter((p) => !q || p.name.toLowerCase().includes(q) || invSupplierName(p.supplierId).toLowerCase().includes(q) || (p.sku || "").toLowerCase().includes(q) || (p.categoria || "").toLowerCase().includes(q) || (p.marca || "").toLowerCase().includes(q))
     .sort((a, b) => a.name.localeCompare(b.name));
   return `
     <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px">
-      <input type="text" id="inv-search" class="input" placeholder="Buscar producto, proveedor, SKU o categoría…" value="${esc(inventarioSearch)}" style="max-width:360px;margin-bottom:0" />
+      <input type="text" id="inv-search" class="input" placeholder="Buscar producto, marca, proveedor, SKU o categoría…" value="${esc(inventarioSearch)}" style="max-width:360px;margin-bottom:0" />
       <button class="btn btn-secondary btn-sm" data-action="inv-export-productos">⬇️ Exportar a Excel${q ? ` (${list.length})` : ""}</button>
     </div>
     <div class="panel" style="overflow-x:auto">
@@ -2766,7 +2766,7 @@ function viewInventarioProductos() {
           const status = productWorstStatus(p.id);
           const range = [p.minQty, p.optimalQty, p.maxQty].map((v) => (v == null ? "—" : v)).join(" / ");
           return `<tr>
-            <td><a href="#/producto/${p.id}" class="link-more" style="color:var(--ink)">${esc(p.name)}</a><div class="entity-card-meta">${[p.sku, p.categoria, p.unit, p.packageSize ? String(p.packageSize) : null].filter(Boolean).map(esc).join(" · ")}</div></td>
+            <td><a href="#/producto/${p.id}" class="link-more" style="color:var(--ink)">${esc(p.name)}</a><div class="entity-card-meta">${[p.marca, p.sku, p.categoria, p.unit, p.packageSize ? String(p.packageSize) : null].filter(Boolean).map(esc).join(" · ")}</div></td>
             <td>${esc(invSupplierName(p.supplierId))}</td>
             <td>${total || total === 0 ? total : "—"} UND</td>
             <td>${statusBadge(status)}</td>
@@ -2858,7 +2858,7 @@ function viewInventarioProductoDetail(id) {
   <div class="detail-view">
     <div class="detail-head">
       <div><a href="#/inventario" class="back-link">← Inventario</a><h2>${esc(p.name)}</h2>
-        <div class="detail-sub">${[p.sku, p.categoria, invSupplierName(p.supplierId), p.unit, p.packageSize ? String(p.packageSize) : null].filter(Boolean).map(esc).join(" · ")}</div>
+        <div class="detail-sub">${[p.marca, p.sku, p.categoria, invSupplierName(p.supplierId), p.unit, p.packageSize ? String(p.packageSize) : null].filter(Boolean).map(esc).join(" · ")}</div>
       </div>
       <div class="detail-actions">
         <button class="btn btn-secondary" data-action="open-modal" data-modal="inv-lot" data-product-id="${p.id}">+ Agregar lote</button>
@@ -4756,6 +4756,7 @@ function openModal(kind, opts = {}) {
       <h3>${p ? "Editar producto" : "Nuevo producto"}</h3>
       <div class="form-grid">
         <label class="span2">Nombre<input class="input" name="name" required value="${esc(p?.name || "")}" /></label>
+        <label>Marca<input class="input" name="marca" value="${esc(p?.marca || "")}" /></label>
         <label>SKU / Código<input class="input" name="sku" value="${esc(p?.sku || "")}" /></label>
         <label>Categoría<input class="input" name="categoria" value="${esc(p?.categoria || "")}" /></label>
         <label class="span2">Proveedor<select class="input" name="supplierId">
@@ -5237,7 +5238,7 @@ async function handleFormSubmit(form) {
     const numVal = (k) => { const v = val(k); return v === "" ? null : parseFloat(v); };
     const intVal = (k) => { const v = val(k); return v === "" ? null : parseInt(v, 10); };
     const rec = {
-      id: form.dataset.id || uid("prd"), name: val("name"), sku: val("sku") || null, categoria: val("categoria") || null,
+      id: form.dataset.id || uid("prd"), name: val("name"), marca: val("marca") || null, sku: val("sku") || null, categoria: val("categoria") || null,
       supplierId: val("supplierId") || null, unit: val("unit"), packageSize: numVal("packageSize"),
       minQty: numVal("minQty"), optimalQty: numVal("optimalQty"), maxQty: numVal("maxQty"), diasAlerta: intVal("diasAlerta"),
       manejaLote: val("manejaLote") === "on", manejaVencimiento: val("manejaVencimiento") === "on",

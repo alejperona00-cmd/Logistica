@@ -116,6 +116,7 @@ create table if not exists inv_suppliers (
 create table if not exists products (
   id uuid primary key default gen_random_uuid(),
   name text not null,
+  marca text,
   supplier_id uuid references inv_suppliers(id) on delete set null,
   unit text,
   package_size double precision,
