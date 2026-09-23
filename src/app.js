@@ -1760,6 +1760,190 @@ function orderCard(o) {
   </a>`;
 }
 
+/* ---------------------------------------------------------------------------
+   IMPORTAR PEDIDOS DESDE EXCEL (archivo de envíos del operador logístico,
+   hoja con columnas "Destinatario - …", "Cliente", "Seguimiento", etc. — el
+   usuario lo sube periódicamente con los envíos vigentes).
+   Usa el mecanismo source/external_id que ya existía en el schema, pensado
+   para integraciones externas (ver claude/arquitectura-acqua-diagnostico.md):
+   "Seguimiento" (código de tracking del operador, único y estable por envío)
+   es el external_id, así que volver a subir un archivo que incluye envíos ya
+   importados antes ACTUALIZA esos pedidos en vez de duplicarlos. Cada corrida
+   deja un registro en integration_sync_logs, y las filas que no se pueden
+   importar (ej. sin "Seguimiento") quedan en integration_errors — nunca se
+   ocultan ni se descartan en silencio.
+   ------------------------------------------------------------------------- */
+const IMPORT_ORDERS_SOURCE = "excel_envios";
+let importOrdersParsed = null; // { rows, errors, fileName } luego de elegir el archivo
+let importOrdersRunning = false;
+
+/** Normaliza las claves de una fila ya parseada por SheetJS (sin tildes,
+ * minúsculas, espacios colapsados) para tolerar pequeñas variaciones del
+ * header del Excel entre una exportación y otra. */
+function importOrdersNormalizeRow(r) {
+  const map = {};
+  Object.keys(r).forEach((k) => { map[stripAccentsLower(k).replace(/\s+/g, " ")] = r[k]; });
+  return map;
+}
+function importOrdersReadCell(normRow, key) {
+  const v = normRow[stripAccentsLower(key).replace(/\s+/g, " ")];
+  return v === undefined || v === null ? "" : String(v).trim();
+}
+
+/** Convierte las filas crudas del Excel al formato que necesita la
+ * importación. No inventa nada: una fila sin "Seguimiento" (el external_id
+ * que evita duplicar en el próximo archivo) se marca como error y no se
+ * importa — nada se fuerza a entrar sin esa clave. */
+function parseImportOrdersRows(rawRows) {
+  const rows = [];
+  const errors = [];
+  rawRows.forEach((raw, i) => {
+    const r = importOrdersNormalizeRow(raw);
+    const fila = i + 2; // fila 1 = header
+    const externalId = importOrdersReadCell(r, "Seguimiento");
+    if (!externalId) { errors.push({ fila, message: "Sin 'Seguimiento' (código único de envío) — no se puede importar sin arriesgar duplicarlo en el próximo archivo." }); return; }
+    const calle = importOrdersReadCell(r, "Destinatario - Calle");
+    const numero = importOrdersReadCell(r, "Destinatario - Número");
+    const piso = importOrdersReadCell(r, "Destinatario - Piso");
+    const depto = importOrdersReadCell(r, "Destinatario - Depto.");
+    const cp = importOrdersReadCell(r, "Destinatario - Código Postal");
+    const localidad = importOrdersReadCell(r, "Destinatario - Localidad");
+    const provincia = importOrdersReadCell(r, "Destinatario - Provincia");
+    const apellido = importOrdersReadCell(r, "Destinatario - Apellido");
+    const nombre = importOrdersReadCell(r, "Destinatario - Nombre");
+    const pisoDepto = [piso && `Piso ${piso}`, depto && `Depto ${depto}`].filter(Boolean).join(", ");
+    const addressLine = ([calle, numero].filter(Boolean).join(" ") + (pisoDepto ? ` (${pisoDepto})` : "")).trim();
+    const clienteInformado = importOrdersReadCell(r, "Cliente");
+    const destinatario = [apellido, nombre].filter(Boolean).join(", ");
+    rows.push({
+      fila, externalId,
+      clienteName: clienteInformado || destinatario || "Cliente sin identificar",
+      clienteEsFallback: !clienteInformado,
+      destinatario, telefono: importOrdersReadCell(r, "Destinatario - Teléfono"),
+      addressLine, cp, localidad, provincia,
+      cantidad: importOrdersReadCell(r, "Paquete - Cantidad"),
+      peso: importOrdersReadCell(r, "Paquete - Peso [kg]"),
+      valorAsegurado: importOrdersReadCell(r, "Valor Asegurado"),
+      remito: importOrdersReadCell(r, "Número de Remito"),
+      contenido: importOrdersReadCell(r, "Código de Orden de Compra"),
+      observaciones: importOrdersReadCell(r, "Observaciones"),
+      estado: importOrdersReadCell(r, "Estado"),
+      fechaDespacho: importOrdersReadCell(r, "Fecha de despacho"),
+    });
+  });
+  return { rows, errors };
+}
+
+function buildImportOrdersPreview(rows) {
+  const existingByExtId = new Set(state.orders.filter((o) => o.source === IMPORT_ORDERS_SOURCE && o.externalId).map((o) => o.externalId));
+  const existingCustomerNames = new Set(state.customers.map((c) => stripAccentsLower(c.name)));
+  let nuevos = 0, actualizados = 0, sinCliente = 0;
+  const clientesNuevos = new Set();
+  rows.forEach((r) => {
+    if (existingByExtId.has(r.externalId)) actualizados++; else nuevos++;
+    if (r.clienteEsFallback) sinCliente++;
+    if (!existingCustomerNames.has(stripAccentsLower(r.clienteName))) clientesNuevos.add(stripAccentsLower(r.clienteName));
+  });
+  return { total: rows.length, nuevos, actualizados, sinCliente, clientesNuevosCount: clientesNuevos.size };
+}
+
+function importOrdersPreviewHTML(stats, errors, fileName) {
+  return `
+    <div class="stat-row wrap">
+      <div class="stat-box"><b>${stats.total}</b><span>Envíos leídos</span></div>
+      <div class="stat-box"><b>${stats.nuevos}</b><span>Pedidos nuevos</span></div>
+      <div class="stat-box"><b>${stats.actualizados}</b><span>Pedidos a actualizar</span></div>
+      <div class="stat-box"><b>${stats.clientesNuevosCount}</b><span>Clientes nuevos</span></div>
+    </div>
+    ${stats.sinCliente ? `<div class="hint" style="margin-top:8px">${stats.sinCliente} envío(s) sin "Cliente" informado en el Excel — se usa el nombre del destinatario.</div>` : ""}
+    ${errors.length ? `<div class="hint" style="margin-top:8px;color:var(--danger)">${errors.length} fila(s) no se van a importar — ${errors.slice(0, 5).map((e) => `fila ${e.fila} (${esc(e.message)})`).join("; ")}${errors.length > 5 ? "…" : ""}</div>` : ""}
+    <div class="hint" style="margin-top:8px">Archivo: ${esc(fileName)}</div>
+  `;
+}
+
+/** Ejecuta la importación: por cada fila matchea (o crea) cliente y
+ * ubicación de entrega — geocodificando direcciones nuevas —, y crea o
+ * actualiza el pedido según si ya existía un pedido con ese external_id. Al
+ * actualizar un pedido existente NUNCA pisa `status`/`history` (el estado
+ * logístico real, que puede ya estar avanzado en la app) — sólo refresca
+ * datos de contacto/dirección/contenido y guarda el estado del operador en
+ * `commercialStatus`, aparte, tal como está pensado el campo. */
+async function runImportOrders(rows, fileName) {
+  const startedAt = nowISO();
+  let created = 0, updated = 0, failed = 0;
+  const errorRows = [];
+  const locKeyOf = (addressLine, city, province) => stripAccentsLower([addressLine, city, province].filter(Boolean).join(", "));
+  const locationByKey = new Map(state.locations.map((l) => [locKeyOf(l.address, l.city, l.province), l]));
+
+  for (const r of rows) {
+    try {
+      const existing = state.orders.find((o) => o.source === IMPORT_ORDERS_SOURCE && o.externalId === r.externalId);
+      let customer = state.customers.find((c) => stripAccentsLower(c.name) === stripAccentsLower(r.clienteName));
+
+      const lkey = locKeyOf(r.addressLine, r.localidad, r.provincia);
+      let loc = locationByKey.get(lkey);
+      if (!loc) {
+        let lat = null, lng = null;
+        const query = [r.addressLine, r.localidad, r.provincia, "Argentina"].filter(Boolean).join(", ");
+        const geo = await geocodeAddress(query);
+        if (geo[0]) { lat = geo[0].lat; lng = geo[0].lng; }
+        loc = { id: uid("loc"), type: "cliente", name: r.clienteName, address: r.addressLine, city: r.localidad, province: r.provincia, lat, lng, contact: r.destinatario, phone: r.telefono, notes: r.cp ? `CP ${r.cp}` : "" };
+        await persist("locations", loc);
+        locationByKey.set(lkey, loc);
+      }
+      if (!customer) {
+        customer = { id: uid("cus"), name: r.clienteName, phone: r.telefono || "", locationId: loc.id, notes: r.clienteEsFallback ? `Cliente no informado en el Excel de envíos — se usó el destinatario "${r.destinatario}".` : "" };
+        await persist("customers", customer);
+      }
+
+      const items = [{ product: r.contenido || "Envío sin descripción", qty: parseInt(r.cantidad, 10) || 1 }];
+      const notesParts = [];
+      if (r.observaciones) notesParts.push(`Obs.: ${r.observaciones}`);
+      if (r.peso) notesParts.push(`Peso: ${r.peso} kg`);
+      if (r.valorAsegurado) notesParts.push(`Valor asegurado: $${r.valorAsegurado}`);
+      if (r.remito) notesParts.push(`Remito: ${r.remito}`);
+      notesParts.push(`Importado de "${fileName}" el ${todayISO()} (seguimiento ${r.externalId}).`);
+      const notes = notesParts.join(" | ");
+
+      if (existing) {
+        const rec = { ...existing,
+          customerId: customer.id, customerName: customer.name, phone: r.telefono || existing.phone,
+          address: r.addressLine || existing.address, locationId: loc.id,
+          expectedDate: r.fechaDespacho || existing.expectedDate,
+          items, notes, commercialStatus: r.estado || existing.commercialStatus,
+        };
+        await persist("orders", rec);
+        updated++;
+      } else {
+        const rec = {
+          id: uid("ord"), number: r.externalId, customerId: customer.id, customerName: customer.name,
+          phone: r.telefono || "", address: r.addressLine, locationId: loc.id,
+          orderDate: todayISO(), expectedDate: r.fechaDespacho || "", expectedTime: "",
+          priority: "media", items, notes, status: "pendiente", transportId: null,
+          dispatchDate: null, actualDeliveryDate: null, incidentId: null,
+          history: [{ from: null, to: "pendiente", date: nowISO() }],
+          source: IMPORT_ORDERS_SOURCE, externalId: r.externalId, commercialStatus: r.estado || null,
+        };
+        await persist("orders", rec);
+        created++;
+      }
+    } catch (err) {
+      failed++;
+      errorRows.push({ id: uid("ierr"), syncLogId: null, source: IMPORT_ORDERS_SOURCE, entity: "order", externalId: r.externalId, field: null, message: String(err?.message || err), attempts: 1, status: "error" });
+    }
+  }
+
+  const log = {
+    id: uid("isl"), source: IMPORT_ORDERS_SOURCE, startedAt, finishedAt: nowISO(), status: failed ? "completed_with_errors" : "completed",
+    recordsReceived: rows.length, recordsCreated: created, recordsUpdated: updated, recordsUnchanged: 0, recordsFailed: failed,
+    notes: `Archivo: ${fileName}`,
+  };
+  await persist("integration_sync_logs", log);
+  for (const er of errorRows) { er.syncLogId = log.id; await persist("integration_errors", er); }
+
+  return { created, updated, failed, total: rows.length };
+}
+
 function viewPedidos() {
   const statuses = ["todos", ...ORDER_FLOW, "incidencia", "cancelado"];
   let list = state.orders.filter((o) => (pedidosFilter.status === "todos" || o.status === pedidosFilter.status) && inDateFilter(o.expectedDate, pedidosFilter.date));
@@ -1772,6 +1956,7 @@ function viewPedidos() {
   <div class="view-list">
     <div class="list-toolbar">
       <input type="text" id="pedidos-q" placeholder="Buscar por número o cliente…" value="${esc(pedidosFilter.q)}" class="input" />
+      <button type="button" class="btn btn-secondary" data-action="open-modal" data-modal="import-orders">📥 Importar desde Excel</button>
       <a href="#/pedidos/nuevo" class="btn btn-primary">+ Nuevo pedido</a>
     </div>
     <div class="chip-row">${statuses.map((s) => `<button class="chip ${pedidosFilter.status === s ? "active" : ""}" data-pedidos-status="${s}">${s === "todos" ? "Todos" : (ORDER_META[s]?.label || s)}</button>`).join("")}</div>
@@ -1819,6 +2004,8 @@ function orderDetail(id) {
       <div class="panel">
         <div class="panel-head"><h3>Datos del pedido</h3></div>
         <div class="kv"><span>Cliente</span><b>${esc(o.customerName)}</b></div>
+        ${o.source && o.source !== "manual" ? `<div class="kv"><span>Seguimiento</span><b>${esc(o.externalId || "—")}</b></div>` : ""}
+        ${o.commercialStatus ? `<div class="kv"><span>Estado en origen</span><b>${esc(o.commercialStatus)}</b></div>` : ""}
         <div class="kv"><span>Teléfono</span><b>${esc(o.phone || "—")}</b></div>
         <div class="kv"><span>Domicilio</span><b>${esc(o.address)}</b></div>
         <div class="kv"><span>Ubicación</span><b>${esc(loc ? `${loc.city}, ${loc.province}` : "—")}</b></div>
@@ -4460,6 +4647,17 @@ function openModal(kind, opts = {}) {
       </div>
       <div class="form-actions"><button type="button" class="btn btn-ghost" data-action="close-modal">Cancelar</button><button type="submit" class="btn btn-primary">${l ? "Guardar cambios" : "Crear"}</button></div>
     </form>`;
+  } else if (kind === "import-orders") {
+    body = `<div>
+      <h3>Importar pedidos desde Excel</h3>
+      <div class="hint" style="margin-bottom:10px">Subí el archivo de envíos (mismo formato de siempre: columnas de Destinatario, Cliente, Seguimiento, etc.). La app identifica el cliente, arma el pedido a partir del código de seguimiento y geocodifica el destino. Si volvés a subir un archivo que incluye envíos ya importados antes, actualiza esos pedidos en vez de duplicarlos.</div>
+      <input type="file" id="import-orders-file" accept=".xlsx,.xls" class="input" />
+      <div id="import-orders-preview" style="margin-top:12px"></div>
+      <div class="form-actions">
+        <button type="button" class="btn btn-ghost" data-action="close-modal">Cancelar</button>
+        <button type="button" class="btn btn-primary" id="import-orders-confirm" disabled>Confirmar importación</button>
+      </div>
+    </div>`;
   } else if (kind === "task") {
     body = `<form data-form="task-quick">
       <h3>Nueva tarea</h3>
@@ -6072,6 +6270,24 @@ function bindGlobalEvents() {
       return;
     }
 
+    const importConfirm = e.target.closest("#import-orders-confirm");
+    if (importConfirm) {
+      if (!importOrdersParsed || !importOrdersParsed.rows.length || importOrdersRunning) return;
+      importOrdersRunning = true;
+      importConfirm.disabled = true;
+      importConfirm.textContent = "Importando…";
+      (async () => {
+        const { rows, fileName } = importOrdersParsed;
+        const result = await runImportOrders(rows, fileName);
+        importOrdersRunning = false;
+        importOrdersParsed = null;
+        closeModal();
+        toast(`Importación completa: ${result.created} nuevo(s), ${result.updated} actualizado(s)${result.failed ? `, ${result.failed} con error` : ""}`);
+        renderApp();
+      })();
+      return;
+    }
+
     const geocodeBtn = e.target.closest('[data-action="geocode-address"]');
     if (geocodeBtn) {
       (async () => {
@@ -6132,6 +6348,33 @@ function bindGlobalEvents() {
   });
 
   document.addEventListener("change", (e) => {
+    const importFile = e.target.closest("#import-orders-file");
+    if (importFile) {
+      (async () => {
+        const file = importFile.files && importFile.files[0];
+        const preview = $("#import-orders-preview");
+        const confirmBtn = $("#import-orders-confirm");
+        if (!file) return;
+        if (confirmBtn) confirmBtn.disabled = true;
+        if (preview) preview.innerHTML = `<p class="hint">Leyendo archivo…</p>`;
+        try {
+          const buf = await file.arrayBuffer();
+          const wb = XLSXStyle.read(buf, { type: "array" });
+          const ws = wb.Sheets[wb.SheetNames[0]];
+          const rawRows = XLSXStyle.utils.sheet_to_json(ws, { defval: "" });
+          const { rows, errors } = parseImportOrdersRows(rawRows);
+          importOrdersParsed = { rows, errors, fileName: file.name };
+          const stats = buildImportOrdersPreview(rows);
+          if (preview) preview.innerHTML = importOrdersPreviewHTML(stats, errors, file.name);
+          if (confirmBtn) confirmBtn.disabled = rows.length === 0;
+        } catch (err) {
+          importOrdersParsed = null;
+          if (preview) preview.innerHTML = `<p class="hint">No se pudo leer el archivo: ${esc(err.message || String(err))}</p>`;
+        }
+      })();
+      return;
+    }
+
     const geoProvincia = e.target.closest("#geo-f-provincia");
     if (geoProvincia) { mapGeoFilters.provincia = geoProvincia.value; mapGeoFilters.ciudad = ""; renderMainOnly(); return; }
     const geoCiudad = e.target.closest("#geo-f-ciudad");
