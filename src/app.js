@@ -2378,32 +2378,61 @@ function viewTransporte() {
 
 let proveedoresFilter = { q: "" };
 
+/**
+ * Unifica dos fuentes de proveedores que existen en la app:
+ *  - state.suppliers      → proveedores logísticos, ligados a una ubicación, usados en Órdenes de Compra.
+ *  - state.inv_suppliers  → proveedores de insumos, asignados directamente a productos en Inventario.
+ * Antes solo se veían los primeros acá; esta vista ahora detecta y deja editar ambos.
+ */
 function viewProveedores() {
   const q = proveedoresFilter.q.trim().toLowerCase();
-  const list = state.suppliers.filter((s) => {
+
+  const logisticsCards = state.suppliers.filter((s) => {
     if (!q) return true;
     const loc = getById("locations", s.locationId);
     return s.name.toLowerCase().includes(q) || (s.contact || "").toLowerCase().includes(q) ||
       (loc && ((loc.city || "").toLowerCase().includes(q) || (loc.province || "").toLowerCase().includes(q)));
-  }).sort((a, b) => a.name.localeCompare(b.name));
-  return `<div class="view-list">
-    <div class="list-toolbar"><h3 class="muted-title">Proveedores</h3><button class="btn btn-primary" data-action="open-modal" data-modal="location" data-type="proveedor">+ Nuevo proveedor</button></div>
-    <div class="list-toolbar" style="margin-top:-6px">
-      <input type="text" id="proveedores-q" placeholder="Buscar por nombre, contacto o ciudad…" value="${esc(proveedoresFilter.q)}" class="input" />
-    </div>
-    ${list.length ? `<div class="card-grid">${list.map((s) => {
-      const loc = getById("locations", s.locationId);
-      const pos = state.purchase_orders.filter((p) => p.supplierId === s.id);
-      const pending = pos.filter((p) => !["recibida", "controlada", "cerrada"].includes(p.status)).length;
-      const location = loc ? [loc.city, loc.province].filter(Boolean).join(", ") : "";
-      return `<div class="entity-card">
+  }).map((s) => {
+    const loc = getById("locations", s.locationId);
+    const pos = state.purchase_orders.filter((p) => p.supplierId === s.id);
+    const pending = pos.filter((p) => !["recibida", "controlada", "cerrada"].includes(p.status)).length;
+    const location = loc ? [loc.city, loc.province].filter(Boolean).join(", ") : "";
+    return { name: s.name, html: `<div class="entity-card">
         <a href="#/proveedores/${s.id}" style="display:flex;gap:12px;align-items:center;flex:1;min-width:0;color:inherit;text-decoration:none">
           <div class="entity-card-icon">🏭</div>
           <div style="flex:1;min-width:0"><div class="entity-card-title">${esc(s.name)}</div><div class="entity-card-sub">${esc(loc?.address || "")}${location ? ", " + esc(location) : ""}</div><div class="entity-card-meta">${pos.length} OC${pending ? ` · ${pending} pendientes` : ""}${s.phone ? ` · ${esc(s.phone)}` : ""}</div></div>
         </a>
         ${loc ? `<button class="btn btn-secondary btn-sm" data-action="open-modal" data-modal="location" data-id="${loc.id}">Editar</button>` : ""}
-      </div>`;
-    }).join("")}</div>` : emptyState("🏭", "Sin proveedores", q ? "No hay proveedores que coincidan con el filtro actual." : "Cargá tu primer proveedor para empezar a generar órdenes de compra.", q ? "" : `<button class="btn btn-primary" data-action="open-modal" data-modal="location" data-type="proveedor">+ Nuevo proveedor</button>`)}
+      </div>` };
+  });
+
+  const insumosCards = state.inv_suppliers.filter((s) => {
+    if (!q) return true;
+    return s.name.toLowerCase().includes(q) || (s.contact || "").toLowerCase().includes(q) || (s.email || "").toLowerCase().includes(q);
+  }).map((s) => {
+    const cnt = state.products.filter((p) => p.supplierId === s.id).length;
+    return { name: s.name, html: `<div class="entity-card">
+        <div style="display:flex;gap:12px;align-items:center;flex:1;min-width:0">
+          <div class="entity-card-icon">🏷️</div>
+          <div style="flex:1;min-width:0"><div class="entity-card-title">${esc(s.name)}</div><div class="entity-card-sub">Proveedor de insumos · ${cnt} producto${cnt === 1 ? "" : "s"}</div><div class="entity-card-meta">${[s.contact, s.phone, s.email].filter(Boolean).map(esc).join(" · ") || "Sin datos de contacto"}</div></div>
+        </div>
+        <button class="btn btn-secondary btn-sm" data-action="open-modal" data-modal="inv-supplier" data-id="${s.id}">Editar</button>
+      </div>` };
+  });
+
+  const combined = [...logisticsCards, ...insumosCards].sort((a, b) => a.name.localeCompare(b.name));
+
+  return `<div class="view-list">
+    <div class="list-toolbar"><h3 class="muted-title">Proveedores</h3>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn btn-secondary" data-action="open-modal" data-modal="inv-supplier">+ Proveedor de insumos</button>
+        <button class="btn btn-primary" data-action="open-modal" data-modal="location" data-type="proveedor">+ Nuevo proveedor</button>
+      </div>
+    </div>
+    <div class="list-toolbar" style="margin-top:-6px">
+      <input type="text" id="proveedores-q" placeholder="Buscar por nombre, contacto o ciudad…" value="${esc(proveedoresFilter.q)}" class="input" />
+    </div>
+    ${combined.length ? `<div class="card-grid">${combined.map((x) => x.html).join("")}</div>` : emptyState("🏭", "Sin proveedores", q ? "No hay proveedores que coincidan con el filtro actual." : "Cargá tu primer proveedor para empezar a generar órdenes de compra o asociarlo a productos.", "")}
   </div>`;
 }
 
