@@ -3638,6 +3638,72 @@ function clientRankingHTML(rows, opts = {}) {
   </tbody></table>`;
 }
 
+/** Alias de variantes de escritura del mismo transportista en la columna
+ * "Transporte" de la planilla histórica "Caja Business" (importada como
+ * texto libre en orders.notes, sin transportId real — ver
+ * claude/import-historico-caja-business.md). Sólo junta escrituras
+ * inequívocas del mismo nombre; "Carlos" o "Local" solos quedan como están
+ * por ser ambiguos. */
+const HISTORIC_TRANSPORT_ALIASES = {
+  "nico etche": "Nicolás Etchebehere", "nicolas etchebehere": "Nicolás Etchebehere",
+  "nico echebehere": "Nicolás Etchebehere", "nicolas echebehere": "Nicolás Etchebehere",
+  "nico echebere": "Nicolás Etchebehere", "nicolas etchebere": "Nicolás Etchebehere",
+  "nico etchebehere": "Nicolás Etchebehere", "nicolas echebere": "Nicolás Etchebehere",
+  "nico": "Nicolás Etchebehere",
+  "walter": "Walter Ibarra", "walter ibarra": "Walter Ibarra",
+  "marcelo": "Marcelo (moto)", "marcelito": "Marcelo (moto)", "moto marcelo": "Marcelo (moto)",
+  "daniel": "Daniel Aguirre", "daniel aguirre": "Daniel Aguirre",
+  "terminal": "Terminal (encomienda en ómnibus)", "cba terminal": "Terminal (encomienda en ómnibus)",
+  "terminal de caba": "Terminal (encomienda en ómnibus)",
+  "carpio": "Carlos Carpio",
+  "carlos de francisco": "Carlos de Francisco",
+  "bbb": "Bbb",
+  "baronetto": "Baroneto",
+  "scarello": "Scarelo",
+  "el clasico": "El clásico",
+};
+function stripAccentsLower(s) { return (s || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim(); }
+
+/** Ranking de transportes por cantidad de despachos. Cuenta pedidos con
+ * transportId real (dispatches hechos con la app), y además — para los ~6224
+ * pedidos importados del histórico "Caja Business" que no tienen transportId,
+ * sólo texto libre — parsea "Transportista (histórico): …" de orders.notes,
+ * normaliza variantes de escritura conocidas y, si el nombre coincide con un
+ * transporte ya cargado, suma ahí; si no, lo deja como fila de sólo texto
+ * (no vinculada a ningún transportId). */
+function transportRankingData(orders, limit = 15) {
+  const byTransportId = {};
+  const byTextLabel = {};
+  orders.forEach((o) => {
+    if (o.transportId) {
+      byTransportId[o.transportId] = (byTransportId[o.transportId] || 0) + 1;
+      return;
+    }
+    const m = (o.notes || "").match(/Transportista \(histórico\):\s*([^|]+)/);
+    if (!m) return;
+    const raw = m[1].trim();
+    if (!raw) return;
+    const label = HISTORIC_TRANSPORT_ALIASES[stripAccentsLower(raw)] || raw;
+    const match = state.transports.find((t) => stripAccentsLower(t.name) === stripAccentsLower(label));
+    if (match) { byTransportId[match.id] = (byTransportId[match.id] || 0) + 1; return; }
+    const key = stripAccentsLower(label);
+    byTextLabel[key] = byTextLabel[key] || { label, count: 0 };
+    byTextLabel[key].count++;
+  });
+  const rows = [
+    ...Object.entries(byTransportId).map(([id, count]) => { const t = getById("transports", id); return t ? { label: t.name, count, transportId: t.id } : null; }).filter(Boolean),
+    ...Object.values(byTextLabel).map((r) => ({ label: r.label, count: r.count, transportId: null })),
+  ];
+  rows.sort((a, b) => b.count - a.count);
+  return rows.slice(0, limit);
+}
+function transportRankingHTML(rows) {
+  if (!rows.length) return emptyState("🚚", "Sin despachos con transporte informado", "");
+  return `<table class="mini-table"><thead><tr><th>#</th><th>Transporte</th><th>Despachos</th></tr></thead><tbody>
+    ${rows.map((r, i) => `<tr><td>${i + 1}</td><td>${r.transportId ? `<a href="#/transporte/${r.transportId}">${esc(r.label)}</a>` : esc(r.label)}</td><td><b>${r.count}</b></td></tr>`).join("")}
+  </tbody></table>`;
+}
+
 function viewReportes() {
   const orders = state.orders, pos = state.purchase_orders, incs = state.incidents;
   const oStats = { total: orders.length, entregados: orders.filter(o=>o.status==="entregado").length, pendientes: orders.filter(o=>!["entregado","cancelado"].includes(o.status)).length, atrasados: orders.filter(o=>orderUrgency(o).key==="atrasada").length, camino: orders.filter(o=>o.status==="en_camino").length, incidencias: orders.filter(o=>o.status==="incidencia").length };
@@ -3678,6 +3744,10 @@ function viewReportes() {
       <div class="panel span2">
         <div class="panel-head"><h3>Top clientes por despachos</h3><span class="hint">Todo el historial</span></div>
         ${clientRankingHTML(clientRankingData(orders, 15), { showAddress: true })}
+      </div>
+      <div class="panel span2">
+        <div class="panel-head"><h3>Top transportes por despachos</h3><span class="hint">Todo el historial</span></div>
+        ${transportRankingHTML(transportRankingData(orders, 15))}
       </div>
     </div>
   </div>`;
