@@ -2091,6 +2091,7 @@ function viewTransporteDetail(id) {
   const pos = state.purchase_orders.filter((p) => p.transportId === id);
   const incidents = state.incidents.filter((i) => i.relatedType === "transport" && i.relatedId === id);
   const routes = state.routes.filter((r) => r.transportId === id);
+  const rate = transportRate(id);
   transporteMapRoutes = routes;
   const location = [t.city, t.province].filter(Boolean).join(", ");
   return `
@@ -2098,6 +2099,17 @@ function viewTransporteDetail(id) {
     <div class="detail-head"><div><a href="#/transporte" class="back-link">← Transportes</a><h2>${esc(t.name)}${t.code ? ` <span class="topbar-code" style="position:static;">${esc(t.code)}</span>` : ""}</h2><div class="detail-sub">${esc(t.type || "")}${location ? " · " + esc(location) : ""}</div></div>
     <div class="detail-actions"><button class="btn btn-ghost" data-action="open-modal" data-modal="transport" data-id="${t.id}">Editar</button></div></div>
     <div class="detail-grid">
+      <div class="panel">
+        <div class="panel-head"><h3>Costo de transporte</h3><button type="button" class="btn btn-ghost btn-sm" data-action="open-modal" data-modal="exp-rate" data-id="${t.id}">${rate ? "Editar tarifa" : "Configurar tarifa"}</button></div>
+        ${rate ? `
+        <div class="kv"><span>Monto fijo</span><b>${fmtMoney(rate.fixedAmount)}</b></div>
+        <div class="kv"><span>Por km</span><b>${fmtMoney(rate.perKm)}</b></div>
+        <div class="kv"><span>Por caja</span><b>${fmtMoney(rate.perBox)}</b></div>
+        <div class="kv"><span>Por kg</span><b>${fmtMoney(rate.perKg)}</b></div>
+        <div class="kv"><span>% del valor del pedido</span><b>${rate.percent || 0}%</b></div>
+        ${rate.notes ? `<div class="kv-notes"><span>Observaciones</span><p>${esc(rate.notes)}</p></div>` : ""}
+        ` : `<div class="hint">Sin tarifa configurada todavía — se usa para calcular el costo real de cada envío en Expedición.</div>`}
+      </div>
       <div class="panel">
         <div class="panel-head"><h3>Datos de contacto</h3></div>
         ${t.businessName ? `<div class="kv"><span>Razón social</span><b>${esc(t.businessName)}</b></div>` : ""}
