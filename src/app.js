@@ -525,6 +525,7 @@ const NAV = [
   { view: "transporte", label: "Transporte", icon: "truck" },
   { view: "expedicion", label: "Expedición", icon: "dispatch" },
   { view: "ubicaciones", label: "Ubicaciones", icon: "pin" },
+  { view: "proveedores", label: "Proveedores", icon: "supplier" },
   { view: "inventario", label: "Inventario", icon: "layers" },
   { view: "produccion", label: "Producción", icon: "factory" },
   { view: "incidencias", label: "Incidencias", icon: "alert" },
@@ -541,6 +542,7 @@ const NAV_ICONS = {
   cart: '<circle cx="9.5" cy="19.5" r="1.4"/><circle cx="17.5" cy="19.5" r="1.4"/><path d="M3 4h2l2.2 11.2a2 2 0 0 0 2 1.6h8a2 2 0 0 0 2-1.6L21 8H6" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" fill="none"/>',
   truck: '<path d="M3 7h11v9H3z" stroke-width="1.7" stroke-linejoin="round" fill="none"/><path d="M14 10h4l3 3v3h-7z" stroke-width="1.7" stroke-linejoin="round" fill="none"/><circle cx="7" cy="18" r="1.6"/><circle cx="17.5" cy="18" r="1.6"/>',
   pin: '<path d="M12 21s7-6.5 7-12a7 7 0 1 0-14 0c0 5.5 7 12 7 12Z" stroke-width="1.7" stroke-linejoin="round" fill="none"/><circle cx="12" cy="9" r="2.3" stroke-width="1.7" fill="none"/>',
+  supplier: '<path d="M4 10.5 12 4l8 6.5V20H4V10.5Z" stroke-width="1.7" stroke-linejoin="round" fill="none"/><path d="M9 20v-5.5h6V20" stroke-width="1.7" stroke-linejoin="round" fill="none"/><path d="M9 11h6" stroke-width="1.5" stroke-linecap="round"/>',
   alert: '<path d="M12 4 2 20h20L12 4Z" stroke-width="1.7" stroke-linejoin="round" fill="none"/><path d="M12 10.5v4" stroke-width="1.9" stroke-linecap="round"/><circle cx="12" cy="17" r="0.9" fill="currentColor" stroke="none"/>',
   check: '<circle cx="12" cy="12" r="8.5" stroke-width="1.7" fill="none"/><path d="M8.3 12.3 11 15l5-6" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" fill="none"/>',
   chart: '<path d="M4 20V10M11 20V4M18 20v-7" stroke-width="1.9" stroke-linecap="round"/>',
@@ -2190,7 +2192,7 @@ function poForm(id) {
   if (!suppliers.length) {
     return `<div class="detail-view">
       <div class="detail-head"><div><a href="#/compras" class="back-link">← Órdenes de compra</a><h2>Nueva orden de compra</h2></div></div>
-      ${emptyState("🏭", "Primero cargá un proveedor", "Una OC necesita un proveedor con ubicación. Cargalo desde Ubicaciones y volvé acá.", `<a href="#/ubicaciones" class="btn btn-primary">Ir a Ubicaciones</a>`)}
+      ${emptyState("🏭", "Primero cargá un proveedor", "Una OC necesita un proveedor con ubicación. Cargalo desde Proveedores y volvé acá.", `<a href="#/proveedores" class="btn btn-primary">Ir a Proveedores</a>`)}
     </div>`;
   }
   return `
@@ -2238,7 +2240,7 @@ function viewProveedorDetail(id) {
   const incidents = state.incidents.filter((i) => (i.relatedType === "purchase_order" && pos.some((p) => p.id === i.relatedId)) || (i.relatedType === "supplier" && i.relatedId === id));
   return `
   <div class="detail-view">
-    <div class="detail-head"><div><a href="#/ubicaciones" class="back-link">← Ubicaciones</a><h2>${esc(s.name)}</h2><div class="detail-sub">${esc(loc ? loc.city + ", " + loc.province : "")}</div></div>
+    <div class="detail-head"><div><a href="#/proveedores" class="back-link">← Proveedores</a><h2>${esc(s.name)}</h2><div class="detail-sub">${esc(loc ? loc.city + ", " + loc.province : "")}</div></div>
     ${loc ? `<div class="detail-actions"><button class="btn btn-ghost" data-action="open-modal" data-modal="location" data-id="${loc.id}">Editar</button></div>` : ""}</div>
     <div class="detail-grid">
       <div class="panel">
@@ -2374,12 +2376,43 @@ function viewTransporte() {
   </div>`;
 }
 
+let proveedoresFilter = { q: "" };
+
+function viewProveedores() {
+  const q = proveedoresFilter.q.trim().toLowerCase();
+  const list = state.suppliers.filter((s) => {
+    if (!q) return true;
+    const loc = getById("locations", s.locationId);
+    return s.name.toLowerCase().includes(q) || (s.contact || "").toLowerCase().includes(q) ||
+      (loc && ((loc.city || "").toLowerCase().includes(q) || (loc.province || "").toLowerCase().includes(q)));
+  }).sort((a, b) => a.name.localeCompare(b.name));
+  return `<div class="view-list">
+    <div class="list-toolbar"><h3 class="muted-title">Proveedores</h3><button class="btn btn-primary" data-action="open-modal" data-modal="location" data-type="proveedor">+ Nuevo proveedor</button></div>
+    <div class="list-toolbar" style="margin-top:-6px">
+      <input type="text" id="proveedores-q" placeholder="Buscar por nombre, contacto o ciudad…" value="${esc(proveedoresFilter.q)}" class="input" />
+    </div>
+    ${list.length ? `<div class="card-grid">${list.map((s) => {
+      const loc = getById("locations", s.locationId);
+      const pos = state.purchase_orders.filter((p) => p.supplierId === s.id);
+      const pending = pos.filter((p) => !["recibida", "controlada", "cerrada"].includes(p.status)).length;
+      const location = loc ? [loc.city, loc.province].filter(Boolean).join(", ") : "";
+      return `<div class="entity-card">
+        <a href="#/proveedores/${s.id}" style="display:flex;gap:12px;align-items:center;flex:1;min-width:0;color:inherit;text-decoration:none">
+          <div class="entity-card-icon">🏭</div>
+          <div style="flex:1;min-width:0"><div class="entity-card-title">${esc(s.name)}</div><div class="entity-card-sub">${esc(loc?.address || "")}${location ? ", " + esc(location) : ""}</div><div class="entity-card-meta">${pos.length} OC${pending ? ` · ${pending} pendientes` : ""}${s.phone ? ` · ${esc(s.phone)}` : ""}</div></div>
+        </a>
+        ${loc ? `<button class="btn btn-secondary btn-sm" data-action="open-modal" data-modal="location" data-id="${loc.id}">Editar</button>` : ""}
+      </div>`;
+    }).join("")}</div>` : emptyState("🏭", "Sin proveedores", q ? "No hay proveedores que coincidan con el filtro actual." : "Cargá tu primer proveedor para empezar a generar órdenes de compra.", q ? "" : `<button class="btn btn-primary" data-action="open-modal" data-modal="location" data-type="proveedor">+ Nuevo proveedor</button>`)}
+  </div>`;
+}
+
 function viewUbicaciones() {
-  const types = Object.keys(LOCATION_TYPES);
-  if (!state.locations.length) {
+  const types = Object.keys(LOCATION_TYPES).filter((t) => t !== "proveedor");
+  if (!state.locations.filter((l) => l.type !== "proveedor").length) {
     return `<div class="view-list">
       <div class="list-toolbar"><h3 class="muted-title">Ubicaciones</h3><button class="btn btn-primary" data-action="open-modal" data-modal="location">+ Nueva ubicación</button></div>
-      ${emptyState("📍", "Sin ubicaciones cargadas", "Cargá tu depósito, tus clientes y tus proveedores para empezar a operar.", `<button class="btn btn-primary" data-action="open-modal" data-modal="location">+ Nueva ubicación</button>`)}
+      ${emptyState("📍", "Sin ubicaciones cargadas", "Cargá tu depósito y tus clientes para empezar a operar. Los proveedores se cargan desde su propia sección.", `<button class="btn btn-primary" data-action="open-modal" data-modal="location">+ Nueva ubicación</button>`)}
     </div>`;
   }
   return `<div class="view-list">
@@ -2399,7 +2432,7 @@ function viewUbicaciones() {
           </div>`;
         }).join("")}</div></div>`;
     }).join("")}
-    ${(() => { ubicacionesMapMarkers = state.locations.map((l) => ({ kind: l.type, loc: l, label: l.name })); return ""; })()}
+    ${(() => { ubicacionesMapMarkers = state.locations.filter((l) => l.type !== "proveedor").map((l) => ({ kind: l.type, loc: l, label: l.name })); return ""; })()}
     <div class="panel"><div class="panel-head"><h3>Todas en el mapa</h3></div><div id="mapa-ubicaciones" class="leaflet-box" style="height:320px"></div></div>
   </div>`;
 }
@@ -4624,7 +4657,7 @@ function openModal(kind, opts = {}) {
       <h3>${l ? "Editar ubicación" : "Nueva ubicación"}</h3>
       <div class="form-grid">
         <label>Nombre<input class="input" name="name" required value="${esc(l?.name || "")}" /></label>
-        <label>Tipo<select class="input" name="type">${Object.entries(LOCATION_TYPES).map(([k,v])=>`<option value="${k}" ${l?.type===k?"selected":""}>${v.label}</option>`).join("")}</select></label>
+        <label>Tipo<select class="input" name="type">${Object.entries(LOCATION_TYPES).map(([k,v])=>`<option value="${k}" ${(l ? l.type===k : opts.type===k)?"selected":""}>${v.label}</option>`).join("")}</select></label>
         <label class="span2">Dirección
           <div class="addr-search-row">
             <input class="input" name="address" id="loc-address" required placeholder="Ej: San Martín 850, Córdoba" value="${esc(l?.address || "")}" />
@@ -5881,7 +5914,7 @@ function renderMain() {
   if (r.view === "transporte") return r.id ? viewTransporteDetail(r.id) : viewTransporte();
   if (r.view === "expedicion") return r.id ? viewExpedicionFicha(r.id) : viewExpedicion();
   if (r.view === "ubicaciones") return viewUbicaciones();
-  if (r.view === "proveedores") return r.id ? viewProveedorDetail(r.id) : viewUbicaciones();
+  if (r.view === "proveedores") return r.id ? viewProveedorDetail(r.id) : viewProveedores();
   if (r.view === "inventario") return viewInventario();
   if (r.view === "producto") return viewInventarioProductoDetail(r.id);
   if (r.view === "produccion") return r.id ? viewProduccionOrderDetail(r.id) : viewProduccion();
@@ -6147,7 +6180,7 @@ function bindGlobalEvents() {
     }
 
     const openModalBtn = e.target.closest("[data-action='open-modal']");
-    if (openModalBtn) { openModal(openModalBtn.dataset.modal, { id: openModalBtn.dataset.id || null, productId: openModalBtn.dataset.productId || null, size: openModalBtn.dataset.size || null }); return; }
+    if (openModalBtn) { openModal(openModalBtn.dataset.modal, { id: openModalBtn.dataset.id || null, productId: openModalBtn.dataset.productId || null, size: openModalBtn.dataset.size || null, type: openModalBtn.dataset.type || null }); return; }
     const closeModalBtn = e.target.closest("[data-action='close-modal']");
     if (closeModalBtn && !e.target.closest("[data-stop]")) { closeModal(); return; }
 
@@ -6482,6 +6515,7 @@ function bindGlobalEvents() {
     if (e.target.id === "pedidos-q") { pedidosFilter.q = e.target.value; debounceRender(); }
     if (e.target.id === "compras-q") { comprasFilter.q = e.target.value; debounceRender(); }
     if (e.target.id === "transporte-q") { transporteFilter.q = e.target.value; debounceRender(); }
+    if (e.target.id === "proveedores-q") { proveedoresFilter.q = e.target.value; debounceRender(); }
     if (e.target.id === "inv-search") { inventarioSearch = e.target.value; debounceRender(); }
     if (e.target.id === "inv-traza-search") { inventarioTrazaQuery = e.target.value; debounceRender(); }
     if (e.target.matches("[data-prod-line-qty]")) {
