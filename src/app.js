@@ -12,6 +12,7 @@ import {
   calculateRoute, openStreetView,
 } from "./map.js";
 import * as XLSXStyle from "xlsx-js-style";
+import JsBarcode from "jsbarcode";
 import { fmtMoney, expedicionStageFromStatus, haversineKm, transportRateCost, expedicionPuntuar, expedicionChecklist } from "./domain/expedicion.js";
 import { orderGeoPoint, transportBasePoint, computeOperationalKpis, nodeSummary, distinctValues, zoneCoverageMarkers, incidentGeoPoint } from "./domain/geo.js";
 import { cameraScanSupported, detectDeviceLabel, openCameraScan } from "./domain/barcode.js";
@@ -1657,6 +1658,23 @@ function viewMapaLogistico() {
 }
 
 /** Se llama después de insertar el HTML en el DOM: monta/actualiza cada mapa Leaflet presente. */
+/** Dibuja el código de barras Code128 de una OF impresa, si el elemento
+ * está presente en el DOM recién montado (mismo patrón que mountMapsIfPresent:
+ * innerHTML destruye y recrea nodos en cada render, así que hay que volver a
+ * "montar" cualquier librería imperativa después). No hace nada si no hay
+ * ningún <svg id="of-print-barcode"> en la vista actual. */
+function mountOfBarcodeIfPresent() {
+  const svg = document.getElementById("of-print-barcode");
+  if (!svg) return;
+  const value = svg.dataset.value;
+  if (!value) return;
+  try {
+    JsBarcode(svg, value, { format: "CODE128", displayValue: true, fontSize: 14, height: 50, margin: 0 });
+  } catch (e) {
+    console.error("No se pudo generar el código de barras de la OF:", e);
+  }
+}
+
 function mountMapsIfPresent() {
   if (document.getElementById("mapa-geo")) {
     const ctx = mapGeoCtx || {};
@@ -6116,6 +6134,7 @@ function renderApp() {
   $$(".kpi-value, .kpi-hero-value, .kpi-hero-sub [data-count]").forEach((el) => animateCount(el, parseInt(el.dataset.count, 10)));
   bindGlobalEvents();
   mountMapsIfPresent();
+  mountOfBarcodeIfPresent();
 }
 
 /* ---------------------------------------------------------------------------
@@ -6819,6 +6838,7 @@ function renderMainOnly() {
   }
   el.querySelectorAll(".kpi-value, .kpi-hero-value, .kpi-hero-sub [data-count]").forEach((cel) => animateCount(cel, parseInt(cel.dataset.count, 10)));
   mountMapsIfPresent();
+  mountOfBarcodeIfPresent();
 }
 
 /* ---------------------------------------------------------------------------
@@ -7366,8 +7386,8 @@ function viewOfImprimir(id) {
           <div style="font-size:13px">Orden de Fabricación</div>
         </div>
         <div style="text-align:right">
-          <div style="font-size:28px;font-weight:800;letter-spacing:3px;font-family:monospace">${esc(of.numero)}</div>
-          <div style="font-size:12px">${statusBadge(OF_ESTADOS[of.estado])}</div>
+          <svg id="of-print-barcode" data-value="${esc(of.numero)}" style="max-width:260px"></svg>
+          <div style="font-size:12px;margin-top:4px">${statusBadge(OF_ESTADOS[of.estado])}</div>
         </div>
       </div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 20px;margin-bottom:14px;font-size:13px">

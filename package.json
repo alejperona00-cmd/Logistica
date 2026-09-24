@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.4",
+    "jsbarcode": "^3.12.3",
     "leaflet": "^1.9.4",
     "xlsx-js-style": "^1.2.0"
   },
