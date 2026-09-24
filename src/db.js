@@ -6,7 +6,7 @@
    ========================================================================== */
 import { supabase } from "./supabaseClient.js";
 
-export const COLLECTIONS = ["locations", "customers", "suppliers", "transports", "routes", "inv_suppliers", "products", "inventory_lots", "stock_movements", "lot_locations", "app_settings", "box_configs", "box_config_items", "production_orders", "orders", "purchase_orders", "incidents", "tasks", "dispatch_details", "transport_rates", "transport_selections", "client_notifications", "logistics_zones", "integration_sync_logs", "integration_errors"];
+export const COLLECTIONS = ["locations", "customers", "suppliers", "transports", "routes", "inv_suppliers", "products", "inventory_lots", "stock_movements", "lot_locations", "app_settings", "box_configs", "box_config_items", "production_orders", "ldp_versions", "ldp_version_items", "manufacturing_orders", "production_reservations", "production_consumptions", "production_substitutions", "production_audit_log", "orders", "purchase_orders", "incidents", "tasks", "dispatch_details", "transport_rates", "transport_selections", "client_notifications", "logistics_zones", "integration_sync_logs", "integration_errors"];
 
 const camelToSnake = (k) => k.replace(/[A-Z]/g, (m) => "_" + m.toLowerCase());
 const snakeToCamel = (k) => k.replace(/_([a-z0-9])/g, (_, c) => c.toUpperCase());
@@ -84,4 +84,13 @@ export function subscribeCollection(col, onChange) {
     .on("postgres_changes", { event: "*", schema: "public", table: col }, () => onChange())
     .subscribe();
   return () => supabase.removeChannel(channel);
+}
+
+/** Llama a una función Postgres (RPC) — usada para operaciones que necesitan
+ * atomicidad del lado del servidor (p.ej. reserva de stock de producción),
+ * cosa que un upsert genérico de saveRecord no puede garantizar. */
+export async function callRpc(name, params) {
+  const { data, error } = await supabase.rpc(name, params);
+  if (error) throw error;
+  return data;
 }

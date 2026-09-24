@@ -223,6 +223,121 @@ create table if not exists production_orders (
   created_at timestamptz not null default now()
 );
 
+-- ---------------------------------------------------------------------------
+-- Producción: Órdenes de Fabricación (OF) — LDP (lista de picking) versionada,
+-- reservas de stock, consumo, sustituciones de producto y auditoría. Es un
+-- flujo nuevo y más completo que convive con `production_orders` (que no se
+-- toca ni se reemplaza) — pensado para producción por lote con trazabilidad
+-- fina. `ean13` en products es aditivo y opcional: `sku` sigue siendo el
+-- código interno.
+-- ---------------------------------------------------------------------------
+alter table products add column if not exists ean13 text;
+
+create table if not exists ldp_versions (
+  id uuid primary key default gen_random_uuid(),
+  box_config_id uuid references box_configs(id) on delete set null,
+  version integer not null,
+  snapshot_size text,
+  snapshot_name text,
+  created_at timestamptz not null default now(),
+  created_by text
+);
+
+create table if not exists ldp_version_items (
+  id uuid primary key default gen_random_uuid(),
+  ldp_version_id uuid references ldp_versions(id) on delete cascade,
+  product_id uuid references products(id) on delete set null,
+  codigo_interno text,
+  nombre text,
+  ean13 text,
+  unidad text,
+  cantidad_requerida double precision not null default 0,
+  estado text not null default 'activo',
+  created_at timestamptz not null default now()
+);
+
+create table if not exists manufacturing_orders (
+  id uuid primary key default gen_random_uuid(),
+  numero text not null unique,
+  box_config_id uuid references box_configs(id) on delete set null,
+  ldp_version_id uuid references ldp_versions(id) on delete set null,
+  cantidad_planificada double precision not null default 0,
+  cantidad_producida double precision not null default 0,
+  estado text not null default 'BORRADOR',
+  fecha_creacion timestamptz not null default now(),
+  fecha_planificacion date,
+  fecha_prevista date,
+  fecha_inicio timestamptz,
+  fecha_cierre timestamptz,
+  created_by text,
+  usuario_responsable text,
+  almacen_origen_id uuid references locations(id) on delete set null,
+  almacen_intermedio_id uuid references locations(id) on delete set null,
+  motivo_pausa text,
+  motivo_bloqueo text,
+  codigo_barras text unique,
+  notes text,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists production_reservations (
+  id uuid primary key default gen_random_uuid(),
+  manufacturing_order_id uuid references manufacturing_orders(id) on delete cascade,
+  product_id uuid references products(id) on delete set null,
+  ean13 text,
+  cantidad double precision not null default 0,
+  estado text not null default 'RESERVADO',
+  almacen_id uuid references locations(id) on delete set null,
+  usuario text,
+  fecha timestamptz not null default now(),
+  created_at timestamptz not null default now()
+);
+
+create table if not exists production_consumptions (
+  id uuid primary key default gen_random_uuid(),
+  manufacturing_order_id uuid references manufacturing_orders(id) on delete cascade,
+  product_id uuid references products(id) on delete set null,
+  lot_id uuid references inventory_lots(id) on delete set null,
+  cantidad double precision not null default 0,
+  tipo text not null default 'consumo',
+  usuario text,
+  dispositivo text,
+  operation_uid text unique,
+  stock_movement_id uuid references stock_movements(id) on delete set null,
+  fecha timestamptz not null default now(),
+  created_at timestamptz not null default now()
+);
+
+create table if not exists production_substitutions (
+  id uuid primary key default gen_random_uuid(),
+  manufacturing_order_id uuid references manufacturing_orders(id) on delete cascade,
+  producto_original_id uuid references products(id) on delete set null,
+  ean_original text,
+  producto_sustituto_id uuid references products(id) on delete set null,
+  ean_sustituto text,
+  cantidad double precision not null default 0,
+  usuario text,
+  fecha timestamptz not null default now(),
+  motivo text,
+  confirmado_doble_escaneo boolean not null default false,
+  reserva_original_id uuid references production_reservations(id) on delete set null,
+  reserva_sustituto_id uuid references production_reservations(id) on delete set null,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists production_audit_log (
+  id uuid primary key default gen_random_uuid(),
+  manufacturing_order_id uuid references manufacturing_orders(id) on delete cascade,
+  product_id uuid references products(id) on delete set null,
+  operacion text not null,
+  usuario text,
+  fecha timestamptz not null default now(),
+  info_anterior jsonb,
+  info_nueva jsonb,
+  notas text,
+  created_at timestamptz not null default now()
+);
+
 create table if not exists orders (
   id uuid primary key default gen_random_uuid(),
   number text not null,
@@ -464,7 +579,7 @@ do $$
 declare
   t text;
 begin
-  for t in select unnest(array['locations','customers','suppliers','transports','routes','inv_suppliers','products','inventory_lots','stock_movements','lot_locations','app_settings','box_configs','box_config_items','production_orders','orders','purchase_orders','incidents','tasks','dispatch_details','transport_rates','transport_selections','client_notifications','logistics_zones','integration_sync_logs','integration_errors'])
+  for t in select unnest(array['locations','customers','suppliers','transports','routes','inv_suppliers','products','inventory_lots','stock_movements','lot_locations','app_settings','box_configs','box_config_items','production_orders','ldp_versions','ldp_version_items','manufacturing_orders','production_reservations','production_consumptions','production_substitutions','production_audit_log','orders','purchase_orders','incidents','tasks','dispatch_details','transport_rates','transport_selections','client_notifications','logistics_zones','integration_sync_logs','integration_errors'])
   loop
     execute format('alter table %I enable row level security;', t);
     execute format('drop policy if exists "authenticated_all" on %I;', t);
@@ -485,7 +600,7 @@ do $$
 declare
   t text;
 begin
-  for t in select unnest(array['locations','customers','suppliers','transports','routes','inv_suppliers','products','inventory_lots','stock_movements','lot_locations','app_settings','box_configs','box_config_items','production_orders','orders','purchase_orders','incidents','tasks','dispatch_details','transport_rates','transport_selections','client_notifications','logistics_zones','integration_sync_logs','integration_errors'])
+  for t in select unnest(array['locations','customers','suppliers','transports','routes','inv_suppliers','products','inventory_lots','stock_movements','lot_locations','app_settings','box_configs','box_config_items','production_orders','ldp_versions','ldp_version_items','manufacturing_orders','production_reservations','production_consumptions','production_substitutions','production_audit_log','orders','purchase_orders','incidents','tasks','dispatch_details','transport_rates','transport_selections','client_notifications','logistics_zones','integration_sync_logs','integration_errors'])
   loop
     if not exists (
       select 1 from pg_publication_tables

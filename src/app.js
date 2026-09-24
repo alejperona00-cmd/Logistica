@@ -4,7 +4,7 @@
    y mapa real con Google Maps Platform (Maps JS API, Places API (New),
    Geocoding, Directions, Street View).
    ========================================================================== */
-import { COLLECTIONS, loadAll, saveRecord, deleteRecord, subscribeCollection } from "./db.js";
+import { COLLECTIONS, loadAll, saveRecord, deleteRecord, subscribeCollection, callRpc } from "./db.js";
 import { signIn, signUp, signOut, getSession, onAuthStateChange } from "./auth.js";
 import {
   mountMap, mountPickerMap, destroyMap, geocodeAddress, mountLogisticsMap, focusLogisticsMap,
@@ -168,6 +168,7 @@ const state = {
   locations: [], customers: [], suppliers: [], transports: [], routes: [],
   inv_suppliers: [], products: [], inventory_lots: [], stock_movements: [], lot_locations: [], app_settings: [],
   box_configs: [], box_config_items: [], production_orders: [],
+  ldp_versions: [], ldp_version_items: [], manufacturing_orders: [], production_reservations: [], production_consumptions: [], production_substitutions: [], production_audit_log: [],
   orders: [], purchase_orders: [], incidents: [], tasks: [],
   dispatch_details: [], transport_rates: [], transport_selections: [], client_notifications: [],
   logistics_zones: [],
@@ -528,6 +529,7 @@ const NAV = [
   { view: "proveedores", label: "Proveedores", icon: "supplier" },
   { view: "inventario", label: "Inventario", icon: "layers" },
   { view: "produccion", label: "Producción", icon: "factory" },
+  { view: "of_produccion", label: "Órdenes de Fabricación", icon: "of" },
   { view: "incidencias", label: "Incidencias", icon: "alert" },
   { view: "tareas", label: "Tareas", icon: "check" },
   { view: "reportes", label: "Reportes", icon: "chart" },
@@ -549,6 +551,7 @@ const NAV_ICONS = {
   gear: '<circle cx="12" cy="12" r="2.9" stroke-width="1.7" fill="none"/><path d="M12 3.5v2.3M12 18.2v2.3M20.5 12h-2.3M5.8 12H3.5M18 6l-1.6 1.6M7.6 16.4 6 18M18 18l-1.6-1.6M7.6 7.6 6 6" stroke-width="1.7" stroke-linecap="round"/>',
   layers: '<rect x="4.5" y="4" width="15" height="6.2" rx="1.2" stroke-width="1.7" fill="none"/><path d="M4.5 14.2h15M4.5 18.2h15" stroke-width="1.7" stroke-linecap="round"/>',
   factory: '<path d="M4 20V11l4.5 3V11l4.5 3V11l4.5 3V6h3v14H4Z" stroke-width="1.7" stroke-linejoin="round" fill="none"/><path d="M8 20v-4h3v4" stroke-width="1.7" stroke-linejoin="round" fill="none"/>',
+  of: '<rect x="6" y="3.5" width="12" height="17" rx="2" stroke-width="1.7" fill="none"/><path d="M9 3.5V3a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v.5" stroke-width="1.6" fill="none"/><path d="M8.5 12.5l2 2 4-4.2" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" fill="none"/>',
   gauge: '<path d="M4 15a8 8 0 1 1 16 0" stroke-width="1.7" stroke-linecap="round" fill="none"/><path d="M12 15 16.2 9.8" stroke-width="1.7" stroke-linecap="round"/><circle cx="12" cy="15" r="1.3" fill="currentColor" stroke="none"/>',
   dispatch: '<circle cx="12" cy="12" r="8.5" stroke-width="1.7" fill="none"/><path d="M12 7.2v4.8l3.4 2" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" fill="none"/>',
 };
@@ -564,6 +567,7 @@ function navBadgeCount(view) {
   if (view === "tareas") return k.pendingTasks.length;
   if (view === "inventario") return state.products.filter((p) => ["vencido", "critico"].includes(productWorstStatus(p.id).key)).length;
   if (view === "produccion") return state.production_orders.filter((o) => ["planificada", "pendiente", "en_produccion"].includes(o.status)).length;
+  if (view === "of_produccion") return state.manufacturing_orders.filter((o) => ["PLANIFICADA", "RESERVADA", "EN_PRODUCCION", "BLOQUEADA"].includes(o.estado)).length;
   if (view === "gerencia") return gerenciaAlertas().filter((a) => a.level === "red").length;
   if (view === "expedicion") return expedicionRequierenAtencion().length;
   return 0;
@@ -1723,7 +1727,7 @@ function mountMapsIfPresent() {
    11. FILTROS DE FECHA (reutilizable)
    ------------------------------------------------------------------------- */
 const DATE_FILTERS = [
-  { key: "todos", label: "Todas" }, { key: "hoy", label: "Hoy" }, { key: "ayer", label: "Ayer" },
+  { key: "todos", label: "Todas" }, { key: "hoy", label: "Hoy" }, { key: "manana", label: "Mañana" }, { key: "pasado", label: "Pasado mañana" }, { key: "ayer", label: "Ayer" },
   { key: "semana", label: "Esta semana" }, { key: "prox_semana", label: "Próx. semana" },
   { key: "mes", label: "Este mes" }, { key: "mes_ant", label: "Mes anterior" },
 ];
@@ -1733,6 +1737,8 @@ function inDateFilter(dateStr, key) {
   const diffDays = Math.round((d - t) / 86400000);
   const sameMonth = (a, b) => a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth();
   if (key === "hoy") return diffDays === 0;
+  if (key === "manana") return diffDays === 1;
+  if (key === "pasado") return diffDays === 2;
   if (key === "ayer") return diffDays === -1;
   if (key === "semana") return diffDays >= -t.getDay() && diffDays < 7 - t.getDay();
   if (key === "prox_semana") return diffDays >= 7 - t.getDay() && diffDays < 14 - t.getDay();
@@ -5077,6 +5083,38 @@ function openModal(kind, opts = {}) {
         <button type="submit" class="btn btn-primary">Confirmar despacho</button>
       </div>
     </form>`;
+  } else if (kind === "of-new") {
+    const finalOptions = ofFinalProductOptions();
+    if (!finalOptions.length) {
+      body = `<div>
+        <h3>Nueva Orden de Fabricación</h3>
+        <div class="hint" style="margin:10px 0">No hay ninguna receta de caja configurada todavía. Configurala primero en Producción → Configurar cajas.</div>
+        <div class="form-actions"><button type="button" class="btn btn-ghost" data-action="close-modal">Cerrar</button></div>
+      </div>`;
+    } else {
+      const depositos = depositoLocations();
+      body = `<form data-form="of-new">
+        <h3>Nueva Orden de Fabricación</h3>
+        <div class="form-grid">
+          <label class="span2">Producto final<select class="input" name="boxConfigId" required>
+            ${finalOptions.map((opt) => `<option value="${opt.config.id}">${esc(boxSizeLabel(opt.size))}${opt.config.name ? " — " + esc(opt.config.name) : ""}</option>`).join("")}
+          </select></label>
+          <label>Cantidad planificada<input class="input" type="number" name="cantidadPlanificada" min="1" step="1" required /></label>
+          <label>Fecha de planificación<input class="input" type="date" name="fechaPlanificacion" value="${todayISO()}" /></label>
+          <label>Fecha prevista<input class="input" type="date" name="fechaPrevista" /></label>
+          <label>Almacén origen<select class="input" name="almacenOrigenId">
+            <option value="">— Sin especificar —</option>
+            ${depositos.map((l) => `<option value="${l.id}">${esc(l.name)}</option>`).join("")}
+          </select></label>
+          <label>Almacén intermedio<select class="input" name="almacenIntermedioId">
+            <option value="">— Sin especificar —</option>
+            ${depositos.map((l) => `<option value="${l.id}">${esc(l.name)}</option>`).join("")}
+          </select></label>
+          <label class="span2">Notas<textarea class="input" name="notes"></textarea></label>
+        </div>
+        <div class="form-actions"><button type="button" class="btn btn-ghost" data-action="close-modal">Cancelar</button><button type="submit" class="btn btn-primary">Crear OF</button></div>
+      </form>`;
+    }
   } else if (kind === "streetview") {
     body = `<div class="sv-modal">
       <div class="panel-head"><h3>360° — ${esc(opts.label || "Vista de calle")}</h3><button type="button" class="btn btn-ghost btn-sm" data-action="close-modal">✕</button></div>
@@ -5448,6 +5486,20 @@ async function handleFormSubmit(form) {
     if (val("docsListas") !== "on") { toast("Confirmá que la documentación está disponible", "warn"); return; }
     await confirmarDespacho(orderId);
     closeModal();
+  } else if (kind === "of-new") {
+    try {
+      const boxConfigId = val("boxConfigId");
+      const cantidadPlanificada = parseFloat(val("cantidadPlanificada")) || 0;
+      const rec = await createManufacturingOrder({
+        boxConfigId, cantidadPlanificada,
+        fechaPlanificacion: val("fechaPlanificacion") || null, fechaPrevista: val("fechaPrevista") || null,
+        almacenOrigenId: val("almacenOrigenId") || null, almacenIntermedioId: val("almacenIntermedioId") || null,
+        notes: val("notes"),
+      });
+      closeModal(); toast(`OF ${rec.numero} creada`); location.hash = `#/of_produccion/${rec.id}`;
+    } catch (e) {
+      toast(e.message || "No se pudo crear la OF", "warn");
+    }
   }
 }
 
@@ -5948,6 +6000,7 @@ function renderMain() {
   if (r.view === "inventario") return viewInventario();
   if (r.view === "producto") return viewInventarioProductoDetail(r.id);
   if (r.view === "produccion") return r.id ? viewProduccionOrderDetail(r.id) : viewProduccion();
+  if (r.view === "of_produccion") return r.id ? viewOfDetail(r.id) : viewOfProduccion();
   if (r.view === "incidencias") return r.id === "nueva" ? incidentForm() : r.id ? incidentDetail(r.id) : viewIncidencias();
   if (r.view === "tareas") return viewTareas();
   if (r.view === "reportes") return viewReportes();
@@ -6297,6 +6350,73 @@ function bindGlobalEvents() {
       }
       return;
     }
+    const ofPlanificarBtn = e.target.closest('[data-action="of-planificar"]');
+    if (ofPlanificarBtn) {
+      (async () => {
+        try { await setOfEstado(ofPlanificarBtn.dataset.id, "PLANIFICADA"); } catch (e) { toast(e.message || "No se pudo planificar la OF", "warn"); }
+      })();
+      return;
+    }
+    const ofReservarBtn = e.target.closest('[data-action="of-reservar"]');
+    if (ofReservarBtn) {
+      (async () => {
+        try { await reservarStockOF(ofReservarBtn.dataset.id); } catch (e) { toast(e.message || "No se pudo reservar stock", "warn"); }
+      })();
+      return;
+    }
+    const ofPausarBtn = e.target.closest('[data-action="of-pausar"]');
+    if (ofPausarBtn) {
+      const motivo = prompt("Motivo de la pausa:");
+      if (!motivo) return;
+      (async () => {
+        try { await setOfEstado(ofPausarBtn.dataset.id, "PAUSADA", { motivo }); } catch (e) { toast(e.message || "No se pudo pausar la OF", "warn"); }
+      })();
+      return;
+    }
+    const ofBloquearBtn = e.target.closest('[data-action="of-bloquear"]');
+    if (ofBloquearBtn) {
+      const motivo = prompt("Motivo del bloqueo:");
+      if (!motivo) return;
+      (async () => {
+        try { await setOfEstado(ofBloquearBtn.dataset.id, "BLOQUEADA", { motivo }); } catch (e) { toast(e.message || "No se pudo bloquear la OF", "warn"); }
+      })();
+      return;
+    }
+    // Simplificación de esta fase: "Reanudar"/"Desbloquear" siempre vuelven a
+    // PLANIFICADA en vez de reconstruir el estado previo exacto (que podía
+    // ser RESERVADA o EN_PRODUCCION) — eso queda para una fase posterior.
+    const ofReanudarBtn = e.target.closest('[data-action="of-reanudar"]');
+    if (ofReanudarBtn) {
+      (async () => {
+        try { await setOfEstado(ofReanudarBtn.dataset.id, "PLANIFICADA"); } catch (e) { toast(e.message || "No se pudo reanudar la OF", "warn"); }
+      })();
+      return;
+    }
+    const ofDesbloquearBtn = e.target.closest('[data-action="of-desbloquear"]');
+    if (ofDesbloquearBtn) {
+      (async () => {
+        try { await setOfEstado(ofDesbloquearBtn.dataset.id, "PLANIFICADA"); } catch (e) { toast(e.message || "No se pudo desbloquear la OF", "warn"); }
+      })();
+      return;
+    }
+    const ofCancelarBtn = e.target.closest('[data-action="of-cancelar"]');
+    if (ofCancelarBtn) {
+      if (confirm("¿Cancelar esta OF? Las reservas activas deberán liberarse por separado.")) {
+        (async () => {
+          try { await setOfEstado(ofCancelarBtn.dataset.id, "CANCELADA"); } catch (e) { toast(e.message || "No se pudo cancelar la OF", "warn"); }
+        })();
+      }
+      return;
+    }
+    const ofLiberarReservaBtn = e.target.closest('[data-action="of-liberar-reserva"]');
+    if (ofLiberarReservaBtn) {
+      const motivo = prompt("Motivo de la liberación (opcional):");
+      if (motivo === null) return;
+      (async () => {
+        try { await liberarReservaOF(ofLiberarReservaBtn.dataset.id, motivo || ""); } catch (e) { toast(e.message || "No se pudo liberar la reserva", "warn"); }
+      })();
+      return;
+    }
     const prodLineAddBtn = e.target.closest('[data-action="prod-line-add"]');
     if (prodLineAddBtn) {
       produccionPlan.lines.push({ id: uid("pline"), size: produccionNextUnusedSize(), quantity: 10 });
@@ -6582,7 +6702,340 @@ function renderMainOnly() {
 }
 
 /* ---------------------------------------------------------------------------
-   25. INICIO
+   25. PRODUCCIÓN — ÓRDENES DE FABRICACIÓN (OF)
+   ---------------------------------------------------------------------------
+   Módulo nuevo y separado del flujo simple de Producción (14.6/14.7), que
+   sigue intacto y sin tocar. Reutiliza box_configs/box_config_items como la
+   "LDP maestra" (se versiona al crear cada OF, para que cambios futuros en
+   la receta no alteren OFs ya creadas), locations (type "deposito") como
+   almacenes, y el mismo mecanismo de auditoría por movimiento que ya usa
+   Inventario. La reserva de stock es atómica del lado del servidor
+   (fn_reservar_produccion, ver migration_of_rpc.sql) para que dos OF
+   simultáneas nunca puedan sobre-reservar el mismo stock.
+   ------------------------------------------------------------------------- */
+const OF_ESTADOS = {
+  BORRADOR: { label: "Borrador", cls: "st-gray" },
+  PLANIFICADA: { label: "Planificada", cls: "st-blue" },
+  RESERVADA: { label: "Reservada", cls: "st-violet" },
+  EN_PRODUCCION: { label: "En producción", cls: "st-blue" },
+  PAUSADA: { label: "Pausada", cls: "st-yellow" },
+  BLOQUEADA: { label: "Bloqueada", cls: "st-red" },
+  OBSERVADA: { label: "Observada", cls: "st-orange" },
+  COMPLETADA: { label: "Completada", cls: "st-green" },
+  CANCELADA: { label: "Cancelada", cls: "st-gray" },
+};
+
+function depositoLocations() {
+  return state.locations.filter((l) => l.type === "deposito");
+}
+
+/** Tamaños de caja que tienen una receta (box_config + items) configurada —
+ * sólo esos se pueden elegir como "producto final" de una OF nueva. */
+function ofFinalProductOptions() {
+  return BOX_SIZES.map((size) => {
+    const config = boxConfigForSize(size);
+    const items = config ? boxConfigItems(config.id) : [];
+    return { size, config, items };
+  }).filter((opt) => opt.config && opt.items.length > 0);
+}
+
+/** Congela la receta actual (box_config_items) de un box_config en una nueva
+ * versión de LDP (ldp_versions + ldp_version_items), para que la OF que la
+ * use quede fija aunque después se edite la receta maestra. */
+async function createLdpVersionSnapshot(boxConfigId) {
+  const items = boxConfigItems(boxConfigId);
+  if (!items.length) throw new Error("La receta de esta caja no tiene productos configurados");
+  const boxConfig = getById("box_configs", boxConfigId);
+  const nextVersion = Math.max(0, ...state.ldp_versions.filter((v) => v.boxConfigId === boxConfigId).map((v) => v.version)) + 1;
+  const usuario = state.session?.user?.email || "Operador";
+  const ldpVersion = {
+    id: uid("ldpv"),
+    boxConfigId,
+    version: nextVersion,
+    snapshotSize: boxConfig?.size || null,
+    snapshotName: boxConfig?.name || boxSizeLabel(boxConfig?.size),
+    createdBy: usuario,
+  };
+  await persist("ldp_versions", ldpVersion);
+  for (const item of items) {
+    const product = getById("products", item.productId);
+    await persist("ldp_version_items", {
+      id: uid("ldpi"),
+      ldpVersionId: ldpVersion.id,
+      productId: item.productId,
+      codigoInterno: product?.sku || null,
+      nombre: product?.name || null,
+      ean13: product?.ean13 || null,
+      unidad: product?.unit || null,
+      cantidadRequerida: item.quantity,
+      estado: "activo",
+    });
+  }
+  return ldpVersion;
+}
+
+/** Crea una OF: valida cantidad, versiona la LDP del producto final elegido,
+ * y genera un número único con reintentos acotados ante una colisión real
+ * de la restricción unique de `numero` (dos usuarios creando a la vez). */
+async function createManufacturingOrder(opts) {
+  const { boxConfigId, cantidadPlanificada, fechaPlanificacion, fechaPrevista, almacenOrigenId, almacenIntermedioId, notes } = opts;
+  if (!(cantidadPlanificada > 0)) throw new Error("La cantidad planificada debe ser mayor a 0");
+  const ldpVersion = await createLdpVersionSnapshot(boxConfigId);
+  const usuario = state.session?.user?.email || "Operador";
+  let saved = null, lastErr = null;
+  for (let attempt = 0; attempt < 8 && !saved; attempt++) {
+    const numero = `OF-${String(state.manufacturing_orders.length + 1 + attempt).padStart(5, "0")}`;
+    const rec = {
+      id: uid("of"), numero, boxConfigId, ldpVersionId: ldpVersion.id,
+      cantidadPlanificada, cantidadProducida: 0, estado: "BORRADOR",
+      fechaCreacion: nowISO(), fechaPlanificacion: fechaPlanificacion || null, fechaPrevista: fechaPrevista || null,
+      fechaInicio: null, fechaCierre: null, createdBy: usuario, usuarioResponsable: usuario,
+      almacenOrigenId: almacenOrigenId || null, almacenIntermedioId: almacenIntermedioId || null,
+      motivoPausa: null, motivoBloqueo: null, codigoBarras: numero, notes: notes || "",
+    };
+    try {
+      const savedRec = await saveRecord("manufacturing_orders", rec);
+      state.manufacturing_orders.push(savedRec);
+      saved = savedRec;
+    } catch (e) { lastErr = e; }
+  }
+  if (!saved) throw lastErr || new Error("No se pudo generar un número de OF único, reintentá");
+  await persist("production_audit_log", {
+    id: uid("aud"), manufacturingOrderId: saved.id, productId: null, operacion: "creacion", usuario,
+    infoAnterior: null, infoNueva: { numero: saved.numero, boxConfigId, cantidadPlanificada, ldpVersionId: ldpVersion.id }, notas: "",
+  });
+  return saved;
+}
+
+/** Calcula, por producto de la LDP versionada de una OF, lo necesario,
+ * disponible, ya reservado por esta OF, faltante y un estado resumen. */
+function ofNeedsRows(of) {
+  const items = state.ldp_version_items.filter((i) => i.ldpVersionId === of.ldpVersionId);
+  return items.map((item) => {
+    const necesario = item.cantidadRequerida * of.cantidadPlanificada;
+    const reservadoOF = state.production_reservations
+      .filter((r) => r.manufacturingOrderId === of.id && r.productId === item.productId && r.estado === "RESERVADO")
+      .reduce((s, r) => s + (r.cantidad || 0), 0);
+    const otrasReservas = state.production_reservations
+      .filter((r) => r.productId === item.productId && r.estado === "RESERVADO" && r.manufacturingOrderId !== of.id)
+      .reduce((s, r) => s + (r.cantidad || 0), 0);
+    const disponible = Math.max(0, productTotalQty(item.productId) - otrasReservas);
+    const faltante = Math.max(0, necesario - reservadoOF - disponible);
+    const estado = reservadoOF >= necesario ? "completo" : (disponible >= necesario - reservadoOF ? "reservable" : "faltante");
+    return {
+      productId: item.productId, nombre: item.nombre, codigoInterno: item.codigoInterno, ean13: item.ean13,
+      necesario, disponible, reservadoOF, faltante, estado,
+    };
+  });
+}
+
+/** Reserva stock para una OF llamando al RPC atómico del servidor
+ * (fn_reservar_produccion) línea por línea, secuencialmente — nunca en
+ * paralelo, para no saturar la DB y para poder atribuir un error a un
+ * producto puntual. */
+async function reservarStockOF(ofId) {
+  const of = getById("manufacturing_orders", ofId);
+  if (!of) return;
+  const rows = ofNeedsRows(of).filter((r) => r.necesario - r.reservadoOF > 0);
+  for (const row of rows) {
+    await callRpc("fn_reservar_produccion", {
+      p_manufacturing_order_id: of.id, p_product_id: row.productId, p_ean13: row.ean13 || null,
+      p_cantidad: row.necesario - row.reservadoOF, p_almacen_id: of.almacenOrigenId || null,
+      p_usuario: state.session?.user?.email || "Operador",
+    });
+  }
+  const fresh = await loadAll();
+  state.production_reservations = fresh.production_reservations;
+  state.production_audit_log = fresh.production_audit_log;
+
+  const completo = ofNeedsRows(of).every((r) => r.faltante === 0);
+  if (completo) {
+    await persist("manufacturing_orders", { ...of, estado: "RESERVADA" });
+    toast("Stock reservado por completo");
+  } else {
+    toast("Reserva parcial: quedan faltantes, ver tabla", "warn");
+  }
+  renderApp();
+}
+
+/** Libera (cancela) una reserva existente vía RPC — nunca la borra, la
+ * marca LIBERADA en el servidor para mantener la auditoría. */
+async function liberarReservaOF(reservationId, motivo) {
+  await callRpc("fn_liberar_reserva_produccion", {
+    p_reservation_id: reservationId, p_usuario: state.session?.user?.email || "Operador", p_motivo: motivo || "",
+  });
+  const fresh = await loadAll();
+  state.production_reservations = fresh.production_reservations;
+  state.production_audit_log = fresh.production_audit_log;
+  toast("Reserva liberada");
+  renderApp();
+}
+
+/** Cambia el estado de una OF (transiciones simples: planificar, pausar,
+ * bloquear, reanudar/desbloquear → PLANIFICADA, cancelar) dejando registro
+ * en la auditoría. */
+async function setOfEstado(ofId, nuevoEstado, opts = {}) {
+  const of = getById("manufacturing_orders", ofId);
+  if (!of) return;
+  if ((nuevoEstado === "PAUSADA" || nuevoEstado === "BLOQUEADA") && !opts.motivo) throw new Error("Se requiere un motivo");
+  const estadoAnterior = of.estado;
+  const rec = { ...of, estado: nuevoEstado };
+  if (nuevoEstado === "PAUSADA") rec.motivoPausa = opts.motivo;
+  if (nuevoEstado === "BLOQUEADA") rec.motivoBloqueo = opts.motivo;
+  if (nuevoEstado !== "PAUSADA") rec.motivoPausa = null;
+  if (nuevoEstado !== "BLOQUEADA") rec.motivoBloqueo = null;
+  await persist("manufacturing_orders", rec);
+  await persist("production_audit_log", {
+    id: uid("aud"), manufacturingOrderId: of.id, productId: null, operacion: "cambio_estado",
+    usuario: state.session?.user?.email || "Operador", infoAnterior: { estado: estadoAnterior }, infoNueva: { estado: nuevoEstado }, notas: opts.motivo || "",
+  });
+  toast(`OF ${of.numero}: ${OF_ESTADOS[nuevoEstado]?.label || nuevoEstado}`);
+  renderApp();
+}
+
+function viewOfProduccion() {
+  const orders = state.manufacturing_orders;
+  if (!orders.length) {
+    return `<div class="view-list">
+      <div class="list-toolbar"><h3 class="muted-title">Órdenes de Fabricación</h3><button class="btn btn-primary" data-action="open-modal" data-modal="of-new">+ Nueva OF</button></div>
+      ${emptyState("🏭", "Sin órdenes de fabricación", "Creá tu primera OF para planificar producción con reserva de stock y trazabilidad completa.", '<button class="btn btn-primary" data-action="open-modal" data-modal="of-new">+ Nueva OF</button>')}
+    </div>`;
+  }
+  const enCurso = orders.filter((o) => ["RESERVADA", "EN_PRODUCCION"].includes(o.estado)).length;
+  const bloqueadas = orders.filter((o) => o.estado === "BLOQUEADA").length;
+  const completadasHoy = orders.filter((o) => o.estado === "COMPLETADA" && (o.fechaCierre || "").slice(0, 10) === todayISO()).length;
+  const sorted = [...orders].sort((a, b) => new Date(b.fechaCreacion || 0) - new Date(a.fechaCreacion || 0));
+  return `<div class="view-list">
+    <div class="list-toolbar"><h3 class="muted-title">Órdenes de Fabricación</h3><button class="btn btn-primary" data-action="open-modal" data-modal="of-new">+ Nueva OF</button></div>
+    <div class="kpi-grid kpi-grid-compact" style="margin-bottom:16px">
+      ${kpiCard(orders.length, "OF totales", "🏭", "kpi-blue", 0)}
+      ${kpiCard(enCurso, "En producción / reservadas", "⚙", "kpi-violet", 40)}
+      ${kpiCard(bloqueadas, "Bloqueadas", "⛔", bloqueadas ? "kpi-red" : "kpi-blue", 80)}
+      ${kpiCard(completadasHoy, "Completadas hoy", "✅", "kpi-blue", 120)}
+    </div>
+    <div class="panel">
+      <div style="overflow-x:auto"><table class="mini-table">
+        <thead><tr><th>Número</th><th>Producto final</th><th style="text-align:right">Cant. planificada</th><th style="text-align:right">Cant. producida</th><th>Estado</th><th>Fecha creación</th></tr></thead>
+        <tbody>${sorted.map((o) => {
+          const cfg = getById("box_configs", o.boxConfigId);
+          const productoFinal = cfg ? `${esc(boxSizeLabel(cfg.size))}${cfg.name ? " — " + esc(cfg.name) : ""}` : "—";
+          return `<tr>
+            <td><a href="#/of_produccion/${o.id}" class="link-more">${esc(o.numero)}</a></td>
+            <td>${productoFinal}</td>
+            <td style="text-align:right">${o.cantidadPlanificada}</td>
+            <td style="text-align:right">${o.cantidadProducida}</td>
+            <td>${statusBadge(OF_ESTADOS[o.estado])}</td>
+            <td>${fmtDateTime(o.fechaCreacion)}</td>
+          </tr>`;
+        }).join("")}</tbody>
+      </table></div>
+    </div>
+  </div>`;
+}
+
+function viewOfDetail(id) {
+  const of = getById("manufacturing_orders", id);
+  if (!of) return emptyState("🤔", "OF no encontrada", "");
+  const cfg = getById("box_configs", of.boxConfigId);
+  const ldpVersion = getById("ldp_versions", of.ldpVersionId);
+  const productoFinal = cfg ? `${esc(boxSizeLabel(cfg.size))}${cfg.name ? " — " + esc(cfg.name) : ""}` : "—";
+  const rows = ofNeedsRows(of);
+  const reservas = state.production_reservations.filter((r) => r.manufacturingOrderId === of.id && r.estado === "RESERVADO");
+  const auditoria = state.production_audit_log.filter((a) => a.manufacturingOrderId === of.id)
+    .sort((a, b) => new Date(b.fecha || 0) - new Date(a.fecha || 0));
+  const NEED_ESTADO_META = {
+    completo: { label: "✓ Completo", cls: "st-green" },
+    reservable: { label: "Reservable", cls: "st-blue" },
+    faltante: { label: "⚠ Faltante", cls: "st-red" },
+  };
+  const actions = [];
+  if (of.estado === "BORRADOR") actions.push(`<button class="btn btn-primary" data-action="of-planificar" data-id="${of.id}">Planificar</button>`);
+  if (of.estado === "PLANIFICADA") actions.push(`<button class="btn btn-primary" data-action="of-reservar" data-id="${of.id}">Reservar stock</button>`);
+  if (["PLANIFICADA", "RESERVADA", "EN_PRODUCCION"].includes(of.estado)) {
+    actions.push(`<button class="btn btn-secondary" data-action="of-pausar" data-id="${of.id}">Pausar</button>`);
+    actions.push(`<button class="btn btn-secondary" data-action="of-bloquear" data-id="${of.id}">Bloquear</button>`);
+  }
+  if (of.estado === "PAUSADA") actions.push(`<button class="btn btn-primary" data-action="of-reanudar" data-id="${of.id}">Reanudar</button>`);
+  if (of.estado === "BLOQUEADA") actions.push(`<button class="btn btn-primary" data-action="of-desbloquear" data-id="${of.id}">Desbloquear</button>`);
+  if (!["COMPLETADA", "CANCELADA"].includes(of.estado)) actions.push(`<button class="btn btn-ghost" data-action="of-cancelar" data-id="${of.id}">Cancelar OF</button>`);
+  return `
+  <div class="detail-view">
+    <div class="detail-head">
+      <div><a href="#/of_produccion" class="back-link">← Órdenes de Fabricación</a><h2>${esc(of.numero)}</h2>
+        <div class="detail-sub">${productoFinal} ${statusBadge(OF_ESTADOS[of.estado])}</div>
+      </div>
+      <div class="detail-actions">${actions.join("")}</div>
+    </div>
+    <div class="detail-grid">
+      <div class="panel">
+        <div class="panel-head"><h3>Resumen</h3></div>
+        <div class="stat-row wrap">
+          <div class="stat-box"><b>${of.cantidadPlanificada}</b><span>Planificada</span></div>
+          <div class="stat-box"><b>${of.cantidadProducida}</b><span>Producida</span></div>
+          <div class="stat-box"><b>${ldpVersion ? "Versión " + ldpVersion.version : "—"}</b><span>LDP</span></div>
+        </div>
+        <div class="kv"><span>Almacén origen</span><b>${of.almacenOrigenId ? esc(locName(of.almacenOrigenId)) : "—"}</b></div>
+        <div class="kv"><span>Almacén intermedio</span><b>${of.almacenIntermedioId ? esc(locName(of.almacenIntermedioId)) : "—"}</b></div>
+        ${of.notes ? `<div class="kv-notes"><span>Notas</span><p>${esc(of.notes)}</p></div>` : ""}
+      </div>
+      <div class="panel">
+        <div class="panel-head"><h3>Fechas</h3></div>
+        <div class="kv"><span>Creación</span><b>${fmtDateTime(of.fechaCreacion)}</b></div>
+        <div class="kv"><span>Planificación</span><b>${of.fechaPlanificacion ? fmtDate(of.fechaPlanificacion) : "—"}</b></div>
+        <div class="kv"><span>Prevista</span><b>${of.fechaPrevista ? fmtDate(of.fechaPrevista) : "—"}</b></div>
+        <div class="kv"><span>Inicio</span><b>${of.fechaInicio ? fmtDateTime(of.fechaInicio) : "—"}</b></div>
+        <div class="kv"><span>Cierre</span><b>${of.fechaCierre ? fmtDateTime(of.fechaCierre) : "—"}</b></div>
+      </div>
+      <div class="panel span2">
+        <div class="panel-head"><h3>Necesidad de materiales</h3></div>
+        <div style="overflow-x:auto"><table class="mini-table">
+          <thead><tr><th>Producto</th><th>EAN-13</th><th style="text-align:right">Necesario</th><th style="text-align:right">Disponible</th><th style="text-align:right">Reservado</th><th style="text-align:right">Faltante</th><th>Estado</th></tr></thead>
+          <tbody>${rows.map((r) => `<tr>
+            <td>${esc(r.nombre || "—")}</td>
+            <td>${esc(r.ean13 || "—")}</td>
+            <td style="text-align:right">${r.necesario}</td>
+            <td style="text-align:right">${r.disponible}</td>
+            <td style="text-align:right">${r.reservadoOF}</td>
+            <td style="text-align:right">${r.faltante}</td>
+            <td>${statusBadge(NEED_ESTADO_META[r.estado])}</td>
+          </tr>`).join("")}</tbody>
+        </table></div>
+      </div>
+      <div class="panel span2">
+        <div class="panel-head"><h3>Reservas activas</h3></div>
+        ${reservas.length ? `<div style="overflow-x:auto"><table class="mini-table">
+          <thead><tr><th>Producto</th><th style="text-align:right">Cantidad</th><th>Almacén</th><th>Usuario</th><th>Fecha</th><th></th></tr></thead>
+          <tbody>${reservas.map((r) => {
+            const p = getById("products", r.productId);
+            return `<tr>
+              <td>${esc(p?.name || "—")}</td>
+              <td style="text-align:right">${r.cantidad}</td>
+              <td>${r.almacenId ? esc(locName(r.almacenId)) : "—"}</td>
+              <td>${esc(r.usuario || "—")}</td>
+              <td>${fmtDateTime(r.fecha)}</td>
+              <td><button class="btn btn-ghost btn-sm" data-action="of-liberar-reserva" data-id="${r.id}">Liberar</button></td>
+            </tr>`;
+          }).join("")}</tbody>
+        </table></div>` : `<div class="hint">Sin reservas activas.</div>`}
+      </div>
+      <div class="panel span2">
+        <div class="panel-head"><h3>Historial / auditoría</h3></div>
+        ${auditoria.length ? `<div style="overflow-x:auto"><table class="mini-table">
+          <thead><tr><th>Operación</th><th>Usuario</th><th>Fecha</th><th>Notas</th></tr></thead>
+          <tbody>${auditoria.map((a) => `<tr>
+            <td>${esc(a.operacion)}</td>
+            <td>${esc(a.usuario || "—")}</td>
+            <td>${fmtDateTime(a.fecha)}</td>
+            <td>${esc(a.notas || "—")}</td>
+          </tr>`).join("")}</tbody>
+        </table></div>` : `<div class="hint">Sin movimientos registrados.</div>`}
+      </div>
+    </div>
+  </div>`;
+}
+
+/* ---------------------------------------------------------------------------
+   26. INICIO
    ------------------------------------------------------------------------- */
 async function boot() {
   state.route = parseHash();
