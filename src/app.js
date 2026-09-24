@@ -5527,6 +5527,63 @@ async function handleFormSubmit(form) {
     } catch (e) {
       toast(e.message || "No se pudo registrar el avance", "warn");
     }
+  } else if (kind === "of-reemplazo-original") {
+    const ofId = form.dataset.id;
+    const of = getById("manufacturing_orders", ofId);
+    const codigo = val("codigo");
+    delete ofReplacementErrors[ofId];
+    try {
+      const product = findProductByScanCode(codigo);
+      if (!product) throw new Error(`Código no reconocido: "${codigo}"`);
+      const row = ofNeedsRows(of).find((r) => r.productId === product.id && r.estado !== "sustituido");
+      if (!row) throw new Error(`"${product.name}" no es un componente pendiente de esta OF`);
+      if (!(row.pendiente > 0)) throw new Error(`"${product.name}" no tiene cantidad pendiente para reemplazar`);
+      ofReplacementState[ofId] = { step: "substitute", originalProductId: product.id, originalName: product.name, cantidad: row.pendiente };
+    } catch (e) {
+      ofReplacementErrors[ofId] = e.message || "No se pudo identificar el producto original";
+    }
+    renderMainOnly();
+  } else if (kind === "of-reemplazo-sustituto-1") {
+    const ofId = form.dataset.id;
+    const codigo = val("codigo");
+    const motivo = val("motivo");
+    const st = ofReplacementState[ofId];
+    delete ofReplacementErrors[ofId];
+    try {
+      if (!st || st.step !== "substitute") throw new Error("Reiniciá el flujo de reemplazo");
+      if (!motivo) throw new Error("El motivo es obligatorio");
+      const product = findProductByScanCode(codigo);
+      if (!product) throw new Error(`Código no reconocido: "${codigo}"`);
+      if (product.id === st.originalProductId) throw new Error("El sustituto no puede ser el mismo producto original");
+      ofReplacementState[ofId] = { ...st, step: "confirm", substituteProductId: product.id, substituteName: product.name, substituteCode: codigo, motivo };
+    } catch (e) {
+      ofReplacementErrors[ofId] = e.message || "No se pudo identificar el producto sustituto";
+    }
+    renderMainOnly();
+  } else if (kind === "of-reemplazo-sustituto-2") {
+    const ofId = form.dataset.id;
+    const codigo = val("codigo");
+    const st = ofReplacementState[ofId];
+    delete ofReplacementErrors[ofId];
+    if (!st || st.step !== "confirm") {
+      ofReplacementErrors[ofId] = "Reiniciá el flujo de reemplazo";
+    } else if (codigo !== st.substituteCode) {
+      ofReplacementState[ofId] = { ...st, step: "substitute" };
+      ofReplacementErrors[ofId] = "El segundo escaneo no coincide con el primero. Volvé a escanear el sustituto.";
+    } else {
+      try {
+        await confirmarReemplazoOF(ofId);
+        return;
+      } catch (e) {
+        ofReplacementErrors[ofId] = e.message || "No se pudo confirmar el reemplazo";
+      }
+    }
+    renderMainOnly();
+  } else if (kind === "of-buscar-codigo") {
+    const codigo = val("codigo").trim();
+    const of = state.manufacturing_orders.find((o) => o.codigoBarras === codigo || o.numero === codigo);
+    if (of) location.hash = `#/of_produccion/${of.id}`;
+    else toast(`No se encontró ninguna OF con el código "${codigo}"`, "warn");
   }
 }
 
@@ -6444,6 +6501,21 @@ function bindGlobalEvents() {
       })();
       return;
     }
+    const ofReemplazoCancelarBtn = e.target.closest('[data-action="of-reemplazo-cancelar"]');
+    if (ofReemplazoCancelarBtn) {
+      const ofId = ofReemplazoCancelarBtn.dataset.id;
+      delete ofReplacementState[ofId];
+      delete ofReplacementErrors[ofId];
+      renderMainOnly();
+      return;
+    }
+    const ofCerrarBtn = e.target.closest('[data-action="of-cerrar"]');
+    if (ofCerrarBtn) {
+      (async () => {
+        try { await cerrarOF(ofCerrarBtn.dataset.id); } catch (e) { toast(e.message || "No se pudo cerrar la OF", "warn"); }
+      })();
+      return;
+    }
     const ofScanCameraBtn = e.target.closest('[data-action="of-scan-camera"]');
     if (ofScanCameraBtn) {
       const ofId = ofScanCameraBtn.dataset.id;
@@ -6854,10 +6926,30 @@ async function createManufacturingOrder(opts) {
  * esta OF (reserva bruta menos lo ya consumido — así la tabla no muestra
  * "reservado" algo que ya se consumió), lo consumido, lo pendiente y el
  * faltante real, más un estado resumen. */
+/** Calcula, por producto de la LDP versionada de una OF: lo necesario, lo
+ * disponible (stock libre no reservado por OTRA OF), lo reservado NETO para
+ * esta OF (reserva bruta menos lo ya consumido), lo consumido, lo pendiente
+ * y el faltante real, más un estado resumen. Si un componente de la LDP fue
+ * reemplazado (production_substitutions activa para esta OF), su fila queda
+ * marcada "sustituido" (con necesario cubierto, nada pendiente) y se agrega
+ * una fila extra para el producto sustituto, consumible igual que cualquier
+ * otro componente — así registrarConsumoOF() no necesita saber nada de
+ * sustituciones, sólo busca por productId en estas filas. */
 function ofNeedsRows(of) {
   const items = state.ldp_version_items.filter((i) => i.ldpVersionId === of.ldpVersionId);
-  return items.map((item) => {
+  const activeSubs = state.production_substitutions.filter((s) => s.manufacturingOrderId === of.id);
+  const rows = [];
+  for (const item of items) {
+    const sub = activeSubs.find((s) => s.productoOriginalId === item.productId);
     const necesario = item.cantidadRequerida * of.cantidadPlanificada;
+    if (sub) {
+      rows.push({
+        productId: item.productId, nombre: item.nombre, codigoInterno: item.codigoInterno, ean13: item.ean13,
+        necesario, disponible: 0, reservadoOF: necesario, consumido: necesario, pendiente: 0, faltante: 0,
+        estado: "sustituido", sustituidoPor: sub.productoSustitutoId,
+      });
+      continue;
+    }
     const reservadoBruto = state.production_reservations
       .filter((r) => r.manufacturingOrderId === of.id && r.productId === item.productId && r.estado === "RESERVADO")
       .reduce((s, r) => s + (r.cantidad || 0), 0);
@@ -6872,11 +6964,34 @@ function ofNeedsRows(of) {
     const pendiente = Math.max(0, necesario - consumido);
     const faltante = Math.max(0, pendiente - reservadoOF - disponible);
     const estado = consumido >= necesario ? "completo" : (reservadoOF + disponible >= pendiente ? "reservable" : "faltante");
-    return {
+    rows.push({
       productId: item.productId, nombre: item.nombre, codigoInterno: item.codigoInterno, ean13: item.ean13,
       necesario, disponible, reservadoOF, consumido, pendiente, faltante, estado,
-    };
-  });
+    });
+  }
+  for (const sub of activeSubs) {
+    const necesario = sub.cantidad;
+    const consumido = state.production_consumptions
+      .filter((c) => c.manufacturingOrderId === of.id && c.productId === sub.productoSustitutoId && c.tipo === "consumo")
+      .reduce((s, c) => s + (c.cantidad || 0), 0);
+    const reservadoBruto = state.production_reservations
+      .filter((r) => r.manufacturingOrderId === of.id && r.productId === sub.productoSustitutoId && r.estado === "RESERVADO")
+      .reduce((s, r) => s + (r.cantidad || 0), 0);
+    const reservadoOF = Math.max(0, reservadoBruto - consumido);
+    const otrasReservas = state.production_reservations
+      .filter((r) => r.productId === sub.productoSustitutoId && r.estado === "RESERVADO" && r.manufacturingOrderId !== of.id)
+      .reduce((s, r) => s + (r.cantidad || 0), 0);
+    const disponible = Math.max(0, productTotalQty(sub.productoSustitutoId) - otrasReservas);
+    const pendiente = Math.max(0, necesario - consumido);
+    const faltante = Math.max(0, pendiente - reservadoOF - disponible);
+    const estado = consumido >= necesario ? "completo" : (reservadoOF + disponible >= pendiente ? "reservable" : "faltante");
+    const p = getById("products", sub.productoSustitutoId);
+    rows.push({
+      productId: sub.productoSustitutoId, nombre: (p?.name || "—") + " (reemplazo)", codigoInterno: p?.sku || null, ean13: sub.eanSustituto,
+      necesario, disponible, reservadoOF, consumido, pendiente, faltante, estado, esSustituto: true,
+    });
+  }
+  return rows;
 }
 
 /** Reserva stock para una OF llamando al RPC atómico del servidor
@@ -6957,6 +7072,13 @@ function viewOfProduccion() {
   const sorted = [...orders].sort((a, b) => new Date(b.fechaCreacion || 0) - new Date(a.fechaCreacion || 0));
   return `<div class="view-list">
     <div class="list-toolbar"><h3 class="muted-title">Órdenes de Fabricación</h3><button class="btn btn-primary" data-action="open-modal" data-modal="of-new">+ Nueva OF</button></div>
+    <div class="panel" style="margin-bottom:16px">
+      <div class="panel-head"><h3>🔎 Identificar OF por código de barras</h3></div>
+      <form data-form="of-buscar-codigo" class="form-grid" style="align-items:end">
+        <label class="span2">Escaneá el código de la OF (o escribilo)<input class="input" name="codigo" id="of-buscar-input" autocomplete="off" /></label>
+        <div><button type="submit" class="btn btn-secondary">Buscar</button></div>
+      </form>
+    </div>
     <div class="kpi-grid kpi-grid-compact" style="margin-bottom:16px">
       ${kpiCard(orders.length, "OF totales", "🏭", "kpi-blue", 0)}
       ${kpiCard(enCurso, "En producción / reservadas", "⚙", "kpi-violet", 40)}
@@ -6997,7 +7119,10 @@ function viewOfDetail(id) {
     completo: { label: "✓ Completo", cls: "st-green" },
     reservable: { label: "Reservable", cls: "st-blue" },
     faltante: { label: "⚠ Faltante", cls: "st-red" },
+    sustituido: { label: "Sustituido", cls: "st-orange" },
   };
+  const closingCheck = ofClosingCheck(of);
+  const substituciones = state.production_substitutions.filter((s) => s.manufacturingOrderId === of.id);
   const actions = [];
   if (of.estado === "BORRADOR") actions.push(`<button class="btn btn-primary" data-action="of-planificar" data-id="${of.id}">Planificar</button>`);
   if (of.estado === "PLANIFICADA") actions.push(`<button class="btn btn-primary" data-action="of-reservar" data-id="${of.id}">Reservar stock</button>`);
@@ -7008,6 +7133,7 @@ function viewOfDetail(id) {
   if (of.estado === "PAUSADA") actions.push(`<button class="btn btn-primary" data-action="of-reanudar" data-id="${of.id}">Reanudar</button>`);
   if (of.estado === "BLOQUEADA") actions.push(`<button class="btn btn-primary" data-action="of-desbloquear" data-id="${of.id}">Desbloquear</button>`);
   if (!["COMPLETADA", "CANCELADA"].includes(of.estado)) actions.push(`<button class="btn btn-ghost" data-action="of-cancelar" data-id="${of.id}">Cancelar OF</button>`);
+  if (!["COMPLETADA", "CANCELADA"].includes(of.estado) && closingCheck.ready) actions.push(`<button class="btn btn-primary" data-action="of-cerrar" data-id="${of.id}">🟢 Cerrar OF</button>`);
   return `
   <div class="detail-view">
     <div class="detail-head">
@@ -7044,6 +7170,7 @@ function viewOfDetail(id) {
       <div class="panel span2">
         <div class="panel-head"><h3>Necesidad de materiales</h3></div>
         ${["RESERVADA", "EN_PRODUCCION"].includes(of.estado) ? viewOfScanPanel(of) : ""}
+        ${["RESERVADA", "EN_PRODUCCION"].includes(of.estado) ? viewOfReplacementPanel(of) : ""}
         <div style="overflow-x:auto"><table class="mini-table">
           <thead><tr><th>Producto</th><th>EAN-13</th><th style="text-align:right">Necesario</th><th style="text-align:right">Disponible</th><th style="text-align:right">Reservado</th><th style="text-align:right">Consumido</th><th style="text-align:right">Faltante</th><th>Estado</th></tr></thead>
           <tbody>${rows.map((r) => `<tr>
@@ -7075,6 +7202,29 @@ function viewOfDetail(id) {
           }).join("")}</tbody>
         </table></div>` : `<div class="hint">Sin reservas activas.</div>`}
       </div>
+      ${substituciones.length ? `<div class="panel span2">
+        <div class="panel-head"><h3>Reemplazos realizados</h3></div>
+        <div style="overflow-x:auto"><table class="mini-table">
+          <thead><tr><th>Original</th><th>Sustituto</th><th style="text-align:right">Cantidad</th><th>Motivo</th><th>Usuario</th><th>Fecha</th></tr></thead>
+          <tbody>${substituciones.map((s) => {
+            const po = getById("products", s.productoOriginalId), ps = getById("products", s.productoSustitutoId);
+            return `<tr>
+              <td>${esc(po?.name || "—")}</td>
+              <td>${esc(ps?.name || "—")}</td>
+              <td style="text-align:right">${s.cantidad}</td>
+              <td>${esc(s.motivo || "—")}</td>
+              <td>${esc(s.usuario || "—")}</td>
+              <td>${fmtDateTime(s.fecha)}</td>
+            </tr>`;
+          }).join("")}</tbody>
+        </table></div>
+      </div>` : ""}
+      ${!["COMPLETADA", "CANCELADA"].includes(of.estado) ? `<div class="panel span2">
+        <div class="panel-head"><h3>Cierre de OF</h3></div>
+        ${closingCheck.ready
+          ? `<div class="hint" style="font-weight:700;color:var(--green,#2e7d32)">🟢 OF LISTA PARA CERRAR</div>`
+          : `<div class="hint" style="font-weight:700;color:var(--red,#c0392b)">🔴 OF NO PUEDE CERRARSE<ul style="margin:6px 0 0 18px">${closingCheck.reasons.map((r) => `<li>${esc(r)}</li>`).join("")}</ul></div>`}
+      </div>` : ""}
       <div class="panel span2">
         <div class="panel-head"><h3>Historial / auditoría</h3></div>
         ${auditoria.length ? `<div style="overflow-x:auto"><table class="mini-table">
@@ -7123,7 +7273,7 @@ async function registrarConsumoOF(ofId, codigoEscaneado, cantidad) {
   const product = findProductByScanCode(codigoEscaneado);
   if (!product) throw new Error(`Código no reconocido: "${codigoEscaneado}"`);
   const row = ofNeedsRows(of).find((r) => r.productId === product.id);
-  if (!row) throw new Error(`"${product.name}" no pertenece a la receta de esta OF. Si es un reemplazo, usá el flujo de reemplazo (próxima fase).`);
+  if (!row) throw new Error(`"${product.name}" no pertenece a la receta de esta OF. Si es un reemplazo, usá el panel "Reemplazo de componente" más abajo.`);
   if (!(cantidad > 0)) throw new Error("Cantidad inválida");
   if (cantidad > row.pendiente + 0.0001) throw new Error(`Excede lo pendiente de "${product.name}": pendiente ${row.pendiente}, se intentó consumir ${cantidad}`);
   const { alloc, remaining } = fefoAllocate(product.id, cantidad);
@@ -7173,6 +7323,153 @@ async function registrarAvanceProduccion(ofId, cantidad) {
     infoAnterior: { cantidadProducida: of.cantidadProducida }, infoNueva: { cantidadProducida: nuevaProducida }, notas: "",
   });
   toast(`Avance registrado: ${nuevaProducida}/${of.cantidadPlanificada}`);
+  renderApp();
+}
+
+/** Estado del asistente de reemplazo (REEMPLAZO), por OF — un objeto en
+ * memoria (no se persiste) porque es un flujo transitorio de varios pasos
+ * con doble escaneo obligatorio; sólo se escribe a la base una vez
+ * confirmado (confirmarReemplazoOF). */
+let ofReplacementState = {};
+let ofReplacementErrors = {};
+
+/** Confirma un reemplazo ya pasado por el doble escaneo: libera (nunca
+ * borra) la reserva activa del producto original para esta OF, reserva el
+ * sustituto por la misma cantidad, y deja un registro inmutable en
+ * production_substitutions + production_audit_log con trazabilidad
+ * completa (original, sustituto, cantidad, usuario, motivo, doble escaneo
+ * confirmado). */
+async function confirmarReemplazoOF(ofId) {
+  const st = ofReplacementState[ofId];
+  if (!st || st.step !== "confirm") throw new Error("Flujo de reemplazo incompleto");
+  const of = getById("manufacturing_orders", ofId);
+  if (!of) throw new Error("OF no encontrada");
+  const originalProduct = getById("products", st.originalProductId);
+  const substituteProduct = getById("products", st.substituteProductId);
+  if (!originalProduct || !substituteProduct) throw new Error("Producto no encontrado");
+  const usuario = state.session?.user?.email || "Operador";
+
+  const reservasOriginal = state.production_reservations.filter(
+    (r) => r.manufacturingOrderId === of.id && r.productId === st.originalProductId && r.estado === "RESERVADO"
+  );
+  let reservaOriginalId = null;
+  for (const r of reservasOriginal) {
+    await callRpc("fn_liberar_reserva_produccion", { p_reservation_id: r.id, p_usuario: usuario, p_motivo: `Reemplazo por ${substituteProduct.name}` });
+    reservaOriginalId = r.id;
+  }
+
+  const resResult = await callRpc("fn_reservar_produccion", {
+    p_manufacturing_order_id: of.id, p_product_id: st.substituteProductId, p_ean13: substituteProduct.ean13 || null,
+    p_cantidad: st.cantidad, p_almacen_id: of.almacenOrigenId || null, p_usuario: usuario,
+  });
+
+  await persist("production_substitutions", {
+    id: uid("sub"), manufacturingOrderId: of.id,
+    productoOriginalId: st.originalProductId, eanOriginal: originalProduct.ean13 || null,
+    productoSustitutoId: st.substituteProductId, eanSustituto: substituteProduct.ean13 || null,
+    cantidad: st.cantidad, usuario, motivo: st.motivo || "", confirmadoDobleEscaneo: true,
+    reservaOriginalId, reservaSustitutoId: (resResult && resResult.reservationId) || null,
+  });
+  await persist("production_audit_log", {
+    id: uid("aud"), manufacturingOrderId: of.id, productId: st.substituteProductId, operacion: "reemplazo", usuario,
+    infoAnterior: { productoOriginalId: st.originalProductId, nombre: originalProduct.name },
+    infoNueva: { productoSustitutoId: st.substituteProductId, nombre: substituteProduct.name, cantidad: st.cantidad },
+    notas: st.motivo || "",
+  });
+
+  const fresh = await loadAll();
+  state.production_reservations = fresh.production_reservations;
+  state.production_substitutions = fresh.production_substitutions;
+  state.production_audit_log = fresh.production_audit_log;
+
+  delete ofReplacementState[ofId];
+  toast(`Reemplazo confirmado: ${originalProduct.name} → ${substituteProduct.name}`);
+  renderApp();
+}
+
+/** Panel del asistente de reemplazo (3 pasos): 1) identificar el producto
+ * original a reemplazar (debe ser un componente pendiente de esta OF y no
+ * estar ya sustituido), 2) escanear el sustituto + motivo obligatorio
+ * (primer escaneo), 3) volver a escanear el mismo sustituto para confirmar
+ * (segundo escaneo obligatorio) — si no coincide exactamente con el primero,
+ * error y vuelve al paso 2, nunca continúa con una discrepancia. */
+function viewOfReplacementPanel(of) {
+  const st = ofReplacementState[of.id];
+  const err = ofReplacementErrors[of.id];
+  const errHtml = err ? `<div class="hint" style="font-weight:700;color:var(--red,#c0392b);margin-bottom:8px">🔴 ${esc(err)}</div>` : "";
+  if (!st) {
+    return `<div class="panel" style="margin:10px 0;background:var(--surface-2,#f7f7f7)">
+      <div class="panel-head"><h3>🔁 Reemplazo de componente</h3></div>
+      ${errHtml}
+      <div class="hint" style="margin-bottom:10px">Usá esto sólo si falta stock de un componente y necesitás sustituirlo por otro. Requiere confirmar el sustituto con doble escaneo.</div>
+      <form data-form="of-reemplazo-original" data-id="${of.id}" class="form-grid" style="align-items:end">
+        <label class="span2">Escaneá o escribí el código del producto ORIGINAL a reemplazar<input class="input" name="codigo" autocomplete="off" /></label>
+        <div><button type="submit" class="btn btn-secondary">Identificar original</button></div>
+      </form>
+    </div>`;
+  }
+  if (st.step === "substitute") {
+    return `<div class="panel" style="margin:10px 0;background:var(--surface-2,#f7f7f7)">
+      <div class="panel-head"><h3>🔁 Reemplazo de componente</h3><button type="button" class="btn btn-ghost btn-sm" data-action="of-reemplazo-cancelar" data-id="${of.id}">Cancelar</button></div>
+      ${errHtml}
+      <div class="hint" style="margin-bottom:10px">Original: <b>${esc(st.originalName)}</b> · Cantidad a reemplazar: <b>${st.cantidad}</b></div>
+      <form data-form="of-reemplazo-sustituto-1" data-id="${of.id}" class="form-grid" style="align-items:end">
+        <label class="span2">Escaneá o escribí el código del producto SUSTITUTO<input class="input" name="codigo" autocomplete="off" /></label>
+        <label class="span2">Motivo del reemplazo<input class="input" name="motivo" required /></label>
+        <div><button type="submit" class="btn btn-secondary">Primer escaneo</button></div>
+      </form>
+    </div>`;
+  }
+  if (st.step === "confirm") {
+    return `<div class="panel" style="margin:10px 0;background:var(--surface-2,#f7f7f7)">
+      <div class="panel-head"><h3>🔁 Reemplazo de componente</h3><button type="button" class="btn btn-ghost btn-sm" data-action="of-reemplazo-cancelar" data-id="${of.id}">Cancelar</button></div>
+      ${errHtml}
+      <div class="hint" style="margin-bottom:10px">Original: <b>${esc(st.originalName)}</b> → Sustituto: <b>${esc(st.substituteName)}</b> · Cantidad: <b>${st.cantidad}</b></div>
+      <div class="hint" style="margin-bottom:10px;font-weight:700">Escaneá de nuevo el mismo código del sustituto para confirmar (doble escaneo obligatorio).</div>
+      <form data-form="of-reemplazo-sustituto-2" data-id="${of.id}" class="form-grid" style="align-items:end">
+        <label class="span2">Segundo escaneo del SUSTITUTO<input class="input" name="codigo" autocomplete="off" /></label>
+        <div><button type="submit" class="btn btn-primary">Confirmar reemplazo</button></div>
+      </form>
+    </div>`;
+  }
+  return "";
+}
+
+/** Evalúa si una OF puede cerrarse: sin componentes pendientes (ni el
+ * original de algo reemplazado, que ya cuenta como cubierto, ni el
+ * sustituto), con algún avance de producción registrado, y sin estar
+ * bloqueada ni ya cerrada/cancelada. Devuelve las razones exactas cuando
+ * no puede, para mostrarlas en el detalle de la OF — nunca un cierre
+ * silencioso ni una razón genérica. */
+function ofClosingCheck(of) {
+  const rows = ofNeedsRows(of);
+  const reasons = [];
+  if (["COMPLETADA", "CANCELADA"].includes(of.estado)) {
+    reasons.push("La OF ya está cerrada o cancelada");
+    return { ready: false, reasons };
+  }
+  const pendientes = rows.filter((r) => r.pendiente > 0);
+  if (pendientes.length) reasons.push(`Faltan componentes por consumir: ${pendientes.map((r) => r.nombre).join(", ")}`);
+  if (!(of.cantidadProducida > 0)) reasons.push("Todavía no se registró ningún avance de producción");
+  if (of.estado === "BLOQUEADA") reasons.push("La OF está bloqueada — desbloqueala primero");
+  return { ready: reasons.length === 0, reasons };
+}
+
+/** Cierra formalmente una OF — sólo si ofClosingCheck() da luz verde;
+ * nunca cierra "a la fuerza" ni con faltantes. */
+async function cerrarOF(ofId) {
+  const of = getById("manufacturing_orders", ofId);
+  if (!of) throw new Error("OF no encontrada");
+  const check = ofClosingCheck(of);
+  if (!check.ready) throw new Error("La OF no puede cerrarse: " + check.reasons.join("; "));
+  const usuario = state.session?.user?.email || "Operador";
+  const estadoAnterior = of.estado;
+  await persist("manufacturing_orders", { ...of, estado: "COMPLETADA", fechaCierre: nowISO() });
+  await persist("production_audit_log", {
+    id: uid("aud"), manufacturingOrderId: of.id, productId: null, operacion: "cierre", usuario,
+    infoAnterior: { estado: estadoAnterior }, infoNueva: { estado: "COMPLETADA" }, notas: "",
+  });
+  toast(`OF ${of.numero} cerrada`);
   renderApp();
 }
 
