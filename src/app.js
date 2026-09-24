@@ -568,7 +568,7 @@ function navBadgeCount(view) {
   if (view === "incidencias") return k.openIncidents.length;
   if (view === "tareas") return k.pendingTasks.length;
   if (view === "inventario") return state.products.filter((p) => ["vencido", "critico"].includes(productWorstStatus(p.id).key)).length;
-  if (view === "produccion") return state.production_orders.filter((o) => ["planificada", "pendiente", "en_produccion"].includes(o.status)).length;
+  if (view === "produccion") return state.manufacturing_orders.filter((o) => ["RESERVADA", "EN_PRODUCCION", "PAUSADA"].includes(o.estado)).length;
   if (view === "of_produccion") return state.manufacturing_orders.filter((o) => ["PLANIFICADA", "RESERVADA", "EN_PRODUCCION", "BLOQUEADA"].includes(o.estado)).length;
   if (view === "gerencia") return gerenciaAlertas().filter((a) => a.level === "red").length;
   if (view === "expedicion") return expedicionRequierenAtencion().length;
@@ -2963,11 +2963,15 @@ function viewInventarioProductoDetail(id) {
 
 /* ---------------------------------------------------------------------------
    14.6 PRODUCCIÓN (planificación de cajas a partir del Inventario existente)
-   No crea un inventario paralelo: usa "products" e "inventory_lots" tal como
-   están. Al confirmar una producción se descuenta stock con el mismo
-   mecanismo FEFO + stock_movements que ya usa Inventario (fefoAllocate /
-   registerMovement), y las cajas producidas quedan cargadas como un producto
-   terminado más dentro del mismo Inventario (ver confirmProduction()).
+   Cálculo puro (composición, stock, tiempo estimado) reutilizado por la
+   ejecución de OF (sección 25) y por el módulo de EJECUCIÓN (viewOfHoy, ver
+   viewProduccion()). Desde la integración Producción ↔ Órdenes de
+   Fabricación, "Confirmar producción" ya NO descuenta stock ni crea
+   production_orders directamente: crearOFsDesdePlan() crea una OF real
+   (manufacturing_orders) por cada tamaño, y es la propia OF — con su
+   reserva y su consumo escaneado — la que mueve el stock real. Este bloque
+   (box_configs/box_config_items) sigue siendo la "LDP maestra" que también
+   usa la sección 25.
    ------------------------------------------------------------------------- */
 const BOX_SIZES = ["estandar", "navidena", "valija"];
 const BOX_SIZE_LABELS = { estandar: "Estándar", navidena: "Navideña", valija: "Valija" };
@@ -2981,7 +2985,7 @@ const PRODUCTION_STATUS_META = {
 };
 const PRODUCTION_FLOW = ["planificada", "pendiente", "en_produccion", "finalizada"];
 
-let produccionTab = "planificar"; // "planificar" | "configurar" | "historial"
+let produccionTab = "hoy"; // "hoy" | "planificar" | "simulador" | "configurar" | "historial"
 // `produccionPlan.lines`: una planificación puede combinar varias líneas de
 // tamaño de caja (ej: 10 L + 5 M) en una sola tanda a confirmar — no se
 // asume una única caja por producción. Tamaños repetidos se consolidan al
@@ -3114,38 +3118,34 @@ function produccionChartsData() {
   return { days, bySize };
 }
 
+/** Módulo de EJECUCIÓN (integración Producción ↔ Órdenes de Fabricación,
+ * punto 1 del pedido): qué OF producir ahora, en qué orden (prioridad),
+ * iniciar, escanear, consumir, sustituir, controlar, etiquetar y cerrar —
+ * todo sobre la misma manufacturing_order que crea/planifica "Órdenes de
+ * Fabricación" (nunca una orden ni un estado paralelo). "Planificar" y
+ * "Simulador" (el flujo simple anterior, 14.6/14.7) se conservan como
+ * herramientas de cálculo — ya no escriben producción real por su cuenta:
+ * su acción final crea una OF real vía crearOFsDesdePlan(). "Histórico" es
+ * el archivo de consulta del sistema anterior (production_orders). */
 function viewProduccion() {
-  const dash = produccionDashboard();
-  const charts = produccionChartsData();
-  const maxDay = Math.max(1, ...charts.days.map((d) => d.boxes));
-  const maxSize = Math.max(1, ...charts.bySize.map((d) => d.boxes));
   return `<div class="view-list">
-    <div class="list-toolbar"><h3 class="muted-title">Producción</h3></div>
-    <div class="kpi-grid kpi-grid-compact" style="margin-bottom:16px">
-      ${kpiCard(dash.plannedToday, "Planificadas hoy", "📦", "kpi-blue", 0)}
-      ${kpiCard(dash.boxesToday, "Cajas producidas hoy", "📦", "kpi-violet", 40)}
-      ${kpiCard(dash.hoursToday.toFixed(1), "Horas de producción", "⏱", "kpi-blue", 80)}
-      ${kpiCard(Math.round(dash.occupancy) + "%", "Capacidad utilizada", "📊", dash.occupancy >= 90 ? "kpi-red" : "kpi-orange", 120)}
-      ${kpiCard(dash.lowStock, "Stock insuficiente", "⚠", dash.lowStock ? "kpi-red" : "kpi-blue", 160)}
-      ${kpiCard(dash.weekBoxes, "Producción de la semana", "📈", "kpi-blue", 200)}
+    <div class="list-toolbar"><h3 class="muted-title">Producción</h3><a href="#/of_produccion" class="btn btn-ghost btn-sm">📋 Planificación (todas las OF)</a></div>
+    <div class="panel" style="margin-bottom:16px">
+      <div class="panel-head"><h3>🔎 Identificar OF por código de barras</h3></div>
+      <form data-form="of-buscar-codigo" class="form-grid" style="align-items:end">
+        <label class="span2">Escaneá el código de la OF (o escribilo)<input class="input" name="codigo" id="of-buscar-input" autocomplete="off" /></label>
+        <div><button type="submit" class="btn btn-secondary">Buscar</button></div>
+      </form>
     </div>
-    <div class="detail-grid" style="margin-bottom:16px">
-      <div class="panel">
-        <div class="panel-head"><h3>Cajas producidas por día</h3></div>
-        <div class="prod-bars">${charts.days.map((d) => `<div class="prod-bar-col"><div class="prod-bar" style="height:${Math.max(4, (d.boxes / maxDay) * 100)}%" title="${d.boxes} cajas"></div><span>${esc(d.label)}</span></div>`).join("")}</div>
-      </div>
-      <div class="panel">
-        <div class="panel-head"><h3>Producción por tamaño</h3></div>
-        ${charts.bySize.map((d) => `<div class="prod-hbar-row"><span class="prod-hbar-label">${esc(boxSizeLabel(d.size))}</span><div class="prod-hbar-track"><div class="prod-hbar-fill" style="width:${Math.max(3, (d.boxes / maxSize) * 100)}%"></div></div><span class="prod-hbar-value">${d.boxes}</span></div>`).join("")}
-      </div>
-    </div>
-    <div class="chip-row">
+    <div class="chip-row" style="margin-bottom:16px">
+      <button class="chip ${produccionTab === "hoy" ? "active" : ""}" data-prod-tab="hoy">Ejecución (OF)</button>
       <button class="chip ${produccionTab === "planificar" ? "active" : ""}" data-prod-tab="planificar">Planificar</button>
       <button class="chip ${produccionTab === "simulador" ? "active" : ""}" data-prod-tab="simulador">Simulador de producción</button>
       <button class="chip ${produccionTab === "configurar" ? "active" : ""}" data-prod-tab="configurar">Configurar cajas</button>
-      <button class="chip ${produccionTab === "historial" ? "active" : ""}" data-prod-tab="historial">Historial (${state.production_orders.length})</button>
+      <button class="chip ${produccionTab === "historial" ? "active" : ""}" data-prod-tab="historial">Histórico (sistema anterior) (${state.production_orders.length})</button>
     </div>
-    ${produccionTab === "planificar" ? viewProduccionPlanificar()
+    ${produccionTab === "hoy" ? viewOfHoy()
+      : produccionTab === "planificar" ? viewProduccionPlanificar()
       : produccionTab === "simulador" ? viewProduccionSimulador()
       : produccionTab === "configurar" ? viewProduccionConfigurar()
       : viewProduccionHistorial()}
@@ -3244,7 +3244,7 @@ function viewProduccionPlanificar() {
       </table></div>
     </div>` : ""}
     <div class="form-actions" style="border-top:none;padding-top:0;justify-content:flex-start">
-      <button class="btn btn-primary" data-action="prod-confirm" ${canConfirm ? "" : "disabled"}>Confirmar producción</button>
+      <button class="btn btn-primary" data-action="prod-confirm" ${canConfirm ? "" : "disabled"}>📋 Crear OF de esta planificación</button>
     </div>
   `;
 }
@@ -3286,10 +3286,33 @@ function viewProduccionConfigurar() {
 }
 
 function viewProduccionHistorial() {
+  const dash = produccionDashboard();
+  const charts = produccionChartsData();
+  const maxDay = Math.max(1, ...charts.days.map((d) => d.boxes));
+  const maxSize = Math.max(1, ...charts.bySize.map((d) => d.boxes));
   const orders = [...state.production_orders].sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
   return `
+    <div class="hint" style="margin-bottom:12px">Sistema anterior de Producción (tabla <code>production_orders</code>) — se conserva íntegro para consulta y trazabilidad de lo ya producido con este flujo. La producción real ahora se planifica y ejecuta por Órdenes de Fabricación; acá no se generan filas nuevas.</div>
+    <div class="kpi-grid kpi-grid-compact" style="margin-bottom:16px">
+      ${kpiCard(dash.plannedToday, "Planificadas hoy (histórico)", "📦", "kpi-blue", 0)}
+      ${kpiCard(dash.boxesToday, "Cajas producidas hoy (histórico)", "📦", "kpi-violet", 40)}
+      ${kpiCard(dash.hoursToday.toFixed(1), "Horas de producción (histórico)", "⏱", "kpi-blue", 80)}
+      ${kpiCard(Math.round(dash.occupancy) + "%", "Capacidad utilizada (histórico)", "📊", dash.occupancy >= 90 ? "kpi-red" : "kpi-orange", 120)}
+      ${kpiCard(dash.lowStock, "Stock insuficiente", "⚠", dash.lowStock ? "kpi-red" : "kpi-blue", 160)}
+      ${kpiCard(dash.weekBoxes, "Producción de la semana (histórico)", "📈", "kpi-blue", 200)}
+    </div>
+    <div class="detail-grid" style="margin-bottom:16px">
+      <div class="panel">
+        <div class="panel-head"><h3>Cajas producidas por día (histórico)</h3></div>
+        <div class="prod-bars">${charts.days.map((d) => `<div class="prod-bar-col"><div class="prod-bar" style="height:${Math.max(4, (d.boxes / maxDay) * 100)}%" title="${d.boxes} cajas"></div><span>${esc(d.label)}</span></div>`).join("")}</div>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><h3>Producción por tamaño (histórico)</h3></div>
+        ${charts.bySize.map((d) => `<div class="prod-hbar-row"><span class="prod-hbar-label">${esc(boxSizeLabel(d.size))}</span><div class="prod-hbar-track"><div class="prod-hbar-fill" style="width:${Math.max(3, (d.boxes / maxSize) * 100)}%"></div></div><span class="prod-hbar-value">${d.boxes}</span></div>`).join("")}
+      </div>
+    </div>
     <div class="panel">
-      <div class="panel-head"><h3>Historial de producción</h3></div>
+      <div class="panel-head"><h3>Historial de producción (sistema anterior)</h3></div>
       ${orders.length ? `<div style="overflow-x:auto"><table class="mini-table">
         <thead><tr><th>Fecha</th><th>Orden</th><th>Caja</th><th style="text-align:right">Cantidad</th><th>Tiempo estimado</th><th>Tiempo real</th><th>Estado</th></tr></thead>
         <tbody>${orders.map((o) => `<tr>
@@ -3301,7 +3324,7 @@ function viewProduccionHistorial() {
           <td>${o.actualMinutes != null ? fmtMinutes(o.actualMinutes) : "—"}</td>
           <td>${statusBadge(PRODUCTION_STATUS_META[o.status])}</td>
         </tr>`).join("")}</tbody>
-      </table></div>` : emptyState("🏭", "Sin producciones registradas", "Cuando confirmes una producción, va a aparecer acá.")}
+      </table></div>` : emptyState("🏭", "Sin producciones registradas", "Este listado corresponde al sistema anterior de Producción — no se generan filas nuevas acá.")}
     </div>
   `;
 }
@@ -3350,106 +3373,37 @@ function viewProduccionOrderDetail(id) {
   </div>`;
 }
 
-/** Confirma la planificación de `produccionPlan.lines` (una o varias líneas
- * de tamaño de caja): revalida stock CONSOLIDADO por producto entre todos
- * los tamaños de la tanda (para que, por ejemplo, dos tamaños que comparten
- * un mismo insumo no se pisen entre sí), crea una orden de producción por
- * cada tamaño, descuenta inventario por FEFO (mismo mecanismo que
- * Inventario) y da de alta las cajas producidas como producto terminado. */
-async function confirmProduction() {
-  const lines = produccionPlan.lines
-    .map((l) => ({ size: l.size, quantity: Math.max(0, Number(l.quantity) || 0) }))
-    .filter((l) => l.quantity > 0);
-  const bySize = produccionPlanBySize();
-  const totalQty = BOX_SIZES.reduce((s, sz) => s + bySize[sz], 0);
-  const settings = productionSettings();
-  const multiPlan = computeMultiBoxPlan(bySize);
-  if (!lines.length || totalQty <= 0) { toast("Ingresá al menos una cantidad de cajas antes de confirmar", "warn"); return; }
-  if (!multiPlan.hasAllConfigs) { toast(`Configurá las cajas y una cantidad válida antes de confirmar (faltan: ${multiPlan.missingConfigs.map((s) => boxSizeLabel(s)).join(", ")})`, "warn"); return; }
-
-  // Revalidar y reservar stock por PRODUCTO combinando todos los tamaños de
-  // la tanda antes de persistir nada (puede haber cambiado desde que se
-  // armó la planificación).
-  const allocations = [];
-  for (const row of multiPlan.rows) {
-    const { alloc, remaining } = fefoAllocate(row.productId, row.qtyNeeded);
-    if (remaining > 0) {
-      toast(`Stock insuficiente para confirmar: faltan ${remaining} de ${row.name}`, "warn");
-      return;
-    }
-    allocations.push({ row, alloc });
-  }
-
-  // Con un solo tamaño se mantiene el formato de código de siempre
-  // (OP-00N); con varios, se agrupan bajo el mismo número de tanda con un
-  // sufijo por tamaño (OP-00N-S, OP-00N-L, ...).
-  const batchCode = `OP-${String(state.production_orders.length + 1).padStart(3, "0")}`;
-  const multiSize = lines.length > 1;
-  const resumenLineas = lines.map((l) => `Caja ${boxSizeLabel(l.size)} x${l.quantity}`).join(", ");
-  const createdOrders = [];
-
+/** Reemplaza a la antigua confirmProduction() (retirada — escribía
+ * production_orders + descontaba stock + daba de alta producto terminado
+ * en paralelo a las OF, exactamente la duplicación que prohíbe el punto 4
+ * de la integración Producción ↔ Órdenes de Fabricación). Punto de entrada
+ * único para "Planificar" (14.6) y el botón "Crear OF de esta tanda" del
+ * Simulador (14.7): a partir de un `bySize` consolidado, crea una OF real
+ * por cada tamaño con cantidad > 0 vía createManufacturingOrder() — la
+ * única fuente de verdad (manufacturing_orders) — con su propio snapshot
+ * de LDP, cálculo de necesidades y reserva (desde la propia OF). Ninguno de
+ * los dos orígenes vuelve a tocar inventory_lots/production_orders
+ * directamente. */
+async function crearOFsDesdePlan(bySize, opts = {}) {
+  const lines = BOX_SIZES.map((size) => ({ size, quantity: Math.max(0, Number(bySize[size]) || 0) })).filter((l) => l.quantity > 0);
+  if (!lines.length) { toast("No hay cantidades cargadas para crear una OF", "warn"); return; }
+  const created = [];
   for (const line of lines) {
-    const linePlan = computeBoxPlan(line.size, line.quantity);
-    const time = computeProductionTime(line.size, line.quantity, settings);
-    const code = multiSize ? `${batchCode}-${line.size}` : batchCode;
-    const order = {
-      id: uid("pro"), code, boxSize: line.size, boxConfigId: linePlan.config.id, quantity: line.quantity,
-      items: linePlan.items.map((r) => ({ productId: r.productId, name: r.name, sku: r.sku, qtyPerBox: r.qtyPerBox, qtyNeeded: r.qtyNeeded })),
-      status: "planificada", estimatedMinutes: time.total, actualMinutes: null,
-      startedAt: null, finishedAt: null,
-      notes: multiSize ? `Parte de la tanda ${batchCode} (${resumenLineas}).` : "",
-      history: [{ from: null, to: "planificada", date: nowISO() }],
-    };
-    await persist("production_orders", order);
-    createdOrders.push(order);
+    const config = boxConfigForSize(line.size);
+    if (!config) { toast(`Falta configurar la receta de Caja ${boxSizeLabel(line.size)} — no se creó esa OF`, "warn"); continue; }
+    try {
+      const rec = await createManufacturingOrder({
+        boxConfigId: config.id, cantidadPlanificada: line.quantity,
+        fechaPlanificacion: opts.fechaPlanificacion || todayISO(), fechaPrevista: opts.fechaPrevista || null,
+        almacenOrigenId: opts.almacenOrigenId || null, almacenIntermedioId: null,
+        notes: opts.notes || "", customerId: opts.customerId || null, prioridad: opts.prioridad || "NORMAL",
+      });
+      created.push(rec);
+    } catch (e) { toast(e.message || `No se pudo crear la OF de Caja ${boxSizeLabel(line.size)}`, "warn"); }
   }
-
-  // Descuenta stock una sola vez por producto (ya consolidado entre todos
-  // los tamaños) usando la asignación FEFO validada arriba.
-  for (const { row, alloc } of allocations) {
-    for (const a of alloc) {
-      const previousQty = a.lot.quantity;
-      const newQty = previousQty - a.qty;
-      await persist("inventory_lots", { ...a.lot, quantity: newQty });
-      await registerMovement({ productId: row.productId, lotId: a.lot.id, type: "produccion", quantity: a.qty, previousQty, newQty, reason: `Producción ${batchCode} — ${resumenLineas}`, relatedDocument: batchCode });
-    }
-  }
-
-  // Las cajas producidas quedan como un producto terminado más en Inventario
-  // (reutiliza products/inventory_lots — no crea una estructura paralela),
-  // una por cada tamaño de la tanda.
-  for (const line of lines) {
-    const sku = `CAJA-${line.size.toUpperCase()}`;
-    let boxProduct = state.products.find((p) => p.sku === sku && p.categoria === "Caja terminada");
-    if (!boxProduct) {
-      boxProduct = {
-        id: uid("prd"), name: `Caja ${boxSizeLabel(line.size)}`, sku, categoria: "Caja terminada", supplierId: null,
-        unit: "und", packageSize: null, minQty: null, maxQty: null, optimalQty: null,
-        manejaLote: true, manejaVencimiento: false, diasAlerta: null,
-        notes: "Producto terminado generado automáticamente por el módulo de Producción.",
-      };
-      await persist("products", boxProduct);
-    }
-    const lineCode = multiSize ? `${batchCode}-${line.size}` : batchCode;
-    const boxLot = {
-      id: uid("lot"), productId: boxProduct.id, quantity: line.quantity, cantidadInicial: line.quantity, cantidadComprometida: 0,
-      numeroLote: lineCode, fechaElaboracion: todayISO(), deposito: null, bloqueado: false, motivoBloqueo: null,
-      remito: null, ordenCompra: lineCode, fechaRecepcion: todayISO(), costoUnitario: null, expiryDate: null,
-    };
-    await persist("inventory_lots", boxLot);
-    await registerMovement({ productId: boxProduct.id, lotId: boxLot.id, type: "recepcion", quantity: line.quantity, previousQty: 0, newQty: line.quantity, reason: `Producción ${lineCode} — Caja ${boxSizeLabel(line.size)} x${line.quantity}`, relatedDocument: lineCode });
-  }
-
-  toast(multiSize
-    ? `Producción ${batchCode} confirmada (${resumenLineas}) — stock descontado y cajas cargadas en Inventario`
-    : `Producción ${batchCode} confirmada — stock descontado y caja cargada en Inventario`);
-  if (createdOrders.length === 1) {
-    location.hash = `#/produccion/${createdOrders[0].id}`;
-  } else {
-    produccionTab = "historial";
-    location.hash = "#/produccion";
-    renderApp();
-  }
+  if (!created.length) return;
+  toast(created.length === 1 ? `OF ${created[0].numero} creada — ya podés reservar stock y producir desde Producción` : `${created.length} OF creadas — ya podés reservar stock y producir desde Producción`);
+  location.hash = created.length === 1 ? `#/of_produccion/${created[0].id}` : "#/of_produccion";
 }
 
 async function advanceProductionStatus(id) {
@@ -3484,7 +3438,10 @@ async function cancelProductionOrder(id) {
 
    Es puramente una SIMULACIÓN: sólo lee datos existentes (products,
    inventory_lots, box_configs, orders). Nunca descuenta stock ni registra
-   movimientos — eso sigue siendo exclusivo de confirmProduction() (14.6).
+   movimientos — sigue siendo así. Si el usuario decide producir de verdad,
+   el botón "Crear OF de esta tanda" crea una OF real (crearOFsDesdePlan) en
+   vez de escribir producción por su cuenta (punto 26 de la integración:
+   simulación ≠ producción real).
    La tanda en sí (simuladorPedidos) vive únicamente en memoria del navegador
    para esta sesión: no se persiste en Supabase ni crea tablas nuevas, para
    no generar datos ficticios permanentes. El único punto de contacto con
@@ -3656,6 +3613,7 @@ function viewProduccionSimulador() {
       <div class="panel-head"><h3>Pedidos de la tanda (${simuladorPedidos.length})</h3>
         <div style="display:flex;gap:8px">
           <button class="btn btn-ghost btn-sm" data-action="sim-reset">Nueva simulación</button>
+          <button class="btn btn-primary btn-sm" data-action="sim-crear-of">📋 Crear OF de esta tanda</button>
           <button class="btn btn-primary btn-sm" data-action="open-modal" data-modal="sim-pedido">+ Agregar pedido</button>
         </div>
       </div>
@@ -5124,6 +5082,10 @@ function openModal(kind, opts = {}) {
             <option value="">— Sin cliente —</option>
             ${clientesOf.map((c) => `<option value="${c.id}">${esc(c.name)}</option>`).join("")}
           </select></label>
+          <label>Prioridad<select class="input" name="prioridad">
+            ${Object.entries(OF_PRIORIDADES).map(([k, v]) => `<option value="${k}" ${k === "NORMAL" ? "selected" : ""}>${esc(v.label)}</option>`).join("")}
+          </select></label>
+          <label>Responsable <span class="hint">(opcional — por defecto quien crea la OF)</span><input class="input" name="usuarioResponsable" placeholder="${esc(state.session?.user?.email || "")}" /></label>
           <label>Cantidad planificada<input class="input" type="number" name="cantidadPlanificada" min="1" step="1" required /></label>
           <label>Fecha de planificación<input class="input" type="date" name="fechaPlanificacion" value="${todayISO()}" /></label>
           <label>Fecha prevista<input class="input" type="date" name="fechaPrevista" /></label>
@@ -5520,6 +5482,7 @@ async function handleFormSubmit(form) {
         fechaPlanificacion: val("fechaPlanificacion") || null, fechaPrevista: val("fechaPrevista") || null,
         almacenOrigenId: val("almacenOrigenId") || null, almacenIntermedioId: val("almacenIntermedioId") || null,
         notes: val("notes"), customerId: val("customerId") || null,
+        prioridad: val("prioridad") || "NORMAL", usuarioResponsable: val("usuarioResponsable") || null,
       });
       closeModal(); toast(`OF ${rec.numero} creada`); location.hash = `#/of_produccion/${rec.id}`;
     } catch (e) {
@@ -6472,6 +6435,13 @@ function bindGlobalEvents() {
       })();
       return;
     }
+    const ofIniciarBtn = e.target.closest('[data-action="of-iniciar"]');
+    if (ofIniciarBtn) {
+      (async () => {
+        try { await iniciarProduccionOF(ofIniciarBtn.dataset.id); } catch (e) { toast(e.message || "No se pudo iniciar la producción", "warn"); }
+      })();
+      return;
+    }
     const ofPausarBtn = e.target.closest('[data-action="of-pausar"]');
     if (ofPausarBtn) {
       const motivo = prompt("Motivo de la pausa:");
@@ -6490,20 +6460,26 @@ function bindGlobalEvents() {
       })();
       return;
     }
-    // Simplificación de esta fase: "Reanudar"/"Desbloquear" siempre vuelven a
-    // PLANIFICADA en vez de reconstruir el estado previo exacto (que podía
-    // ser RESERVADA o EN_PRODUCCION) — eso queda para una fase posterior.
+    // "Reanudar"/"Desbloquear" restauran el estado real anterior a la pausa/
+    // bloqueo (RESERVADA o EN_PRODUCCION), guardado en of.estadoPrevio por
+    // setOfEstado(); si no hay dato previo (OF antigua), cae a PLANIFICADA.
     const ofReanudarBtn = e.target.closest('[data-action="of-reanudar"]');
     if (ofReanudarBtn) {
       (async () => {
-        try { await setOfEstado(ofReanudarBtn.dataset.id, "PLANIFICADA"); } catch (e) { toast(e.message || "No se pudo reanudar la OF", "warn"); }
+        try {
+          const of = getById("manufacturing_orders", ofReanudarBtn.dataset.id);
+          await setOfEstado(ofReanudarBtn.dataset.id, (of && of.estadoPrevio) || "PLANIFICADA");
+        } catch (e) { toast(e.message || "No se pudo reanudar la OF", "warn"); }
       })();
       return;
     }
     const ofDesbloquearBtn = e.target.closest('[data-action="of-desbloquear"]');
     if (ofDesbloquearBtn) {
       (async () => {
-        try { await setOfEstado(ofDesbloquearBtn.dataset.id, "PLANIFICADA"); } catch (e) { toast(e.message || "No se pudo desbloquear la OF", "warn"); }
+        try {
+          const of = getById("manufacturing_orders", ofDesbloquearBtn.dataset.id);
+          await setOfEstado(ofDesbloquearBtn.dataset.id, (of && of.estadoPrevio) || "PLANIFICADA");
+        } catch (e) { toast(e.message || "No se pudo desbloquear la OF", "warn"); }
       })();
       return;
     }
@@ -6573,7 +6549,7 @@ function bindGlobalEvents() {
       renderMainOnly(); return;
     }
     const prodConfirmBtn = e.target.closest('[data-action="prod-confirm"]');
-    if (prodConfirmBtn && !prodConfirmBtn.disabled) { confirmProduction(); return; }
+    if (prodConfirmBtn && !prodConfirmBtn.disabled) { crearOFsDesdePlan(produccionPlanBySize()); return; }
     const prodAdvanceBtn = e.target.closest('[data-action="prod-advance"]');
     if (prodAdvanceBtn) { advanceProductionStatus(prodAdvanceBtn.dataset.id); return; }
     const prodCancelBtn = e.target.closest('[data-action="prod-cancel"]');
@@ -6581,6 +6557,13 @@ function bindGlobalEvents() {
       if (confirm("¿Cancelar esta orden de producción? El stock ya descontado al confirmarla no se revierte automáticamente.")) {
         cancelProductionOrder(prodCancelBtn.dataset.id);
       }
+      return;
+    }
+    const simCrearOfBtn = e.target.closest('[data-action="sim-crear-of"]');
+    if (simCrearOfBtn) {
+      const notas = simuladorPedidos.length ? `Generado desde el Simulador de producción — Pedidos: ${simuladorPedidos.map((p) => `${p.numero} (${p.cliente})`).join(", ")}.` : "";
+      const fechaPrevista = simuladorPedidos.find((p) => p.fechaEntrega)?.fechaEntrega || null;
+      crearOFsDesdePlan(simuladorConsolidado().bySize, { notes: notas, fechaPrevista });
       return;
     }
     const simResetBtn = e.target.closest('[data-action="sim-reset"]');
@@ -6751,6 +6734,13 @@ function bindGlobalEvents() {
     if (simPeopleSel) { simuladorPeople = parseInt(simPeopleSel.value, 10) || 1; renderMainOnly(); return; }
     const simStartInput = e.target.closest("#sim-start");
     if (simStartInput) { simuladorStart = simStartInput.value || null; renderMainOnly(); return; }
+    const ofPrioridadSel = e.target.closest("[data-of-prioridad]");
+    if (ofPrioridadSel) {
+      (async () => {
+        try { await setOfPrioridad(ofPrioridadSel.dataset.ofPrioridad, ofPrioridadSel.value); } catch (e) { toast(e.message || "No se pudo cambiar la prioridad", "warn"); }
+      })();
+      return;
+    }
     const simSourceSel = e.target.closest("#sim-pedido-source");
     if (simSourceSel) {
       const o = getById("orders", simSourceSel.value);
@@ -6870,6 +6860,46 @@ const OF_ESTADOS = {
   CANCELADA: { label: "Cancelada", cls: "st-gray" },
 };
 
+/** Prioridades de OF (integración Producción ↔ Órdenes de Fabricación) —
+ * independientes de la fecha planificada; `rank` más bajo = más urgente,
+ * usado para ordenar la cola de Producción. */
+const OF_PRIORIDADES = {
+  URGENTE: { label: "Urgente", cls: "st-red", rank: 0 },
+  ALTA: { label: "Alta", cls: "st-orange", rank: 1 },
+  MEDIA: { label: "Media", cls: "st-yellow", rank: 2 },
+  NORMAL: { label: "Normal", cls: "st-blue", rank: 3 },
+  BAJA: { label: "Baja", cls: "st-gray", rank: 4 },
+};
+function ofPrioridadRank(of) { return OF_PRIORIDADES[of.prioridad]?.rank ?? OF_PRIORIDADES.NORMAL.rank; }
+/** Orden de la cola de Producción: 1) prioridad, 2) fecha planificada,
+ * 3) número de OF — la prioridad es independiente de la fecha. */
+function compareOfQueue(a, b) {
+  const rp = ofPrioridadRank(a) - ofPrioridadRank(b);
+  if (rp !== 0) return rp;
+  const fa = a.fechaPlanificacion || a.fechaCreacion || "";
+  const fb = b.fechaPlanificacion || b.fechaCreacion || "";
+  if (fa !== fb) return fa < fb ? -1 : 1;
+  return (a.numero || "").localeCompare(b.numero || "");
+}
+/** "PARCIAL" (punto 20/25 de la integración) se muestra como una etiqueta
+ * derivada — nunca un `estado` guardado aparte — para no tener que tocar
+ * cada lugar que ya valida `of.estado === "EN_PRODUCCION"` (reserva,
+ * consumo, cierre, filtros...). Mismo dato, una sola fuente de verdad. */
+function ofProgresoLabel(of) { return `${of.cantidadProducida || 0} / ${of.cantidadPlanificada || 0}`; }
+function ofEsParcial(of) {
+  return of.estado === "EN_PRODUCCION" && (of.cantidadProducida || 0) > 0 && (of.cantidadProducida || 0) < (of.cantidadPlanificada || 0);
+}
+function ofEstadoBadgeHtml(of) {
+  if (ofEsParcial(of)) return `<span class="badge st-orange"><i class="dot-ind st-orange"></i>Parcial (${ofProgresoLabel(of)})</span>`;
+  return statusBadge(OF_ESTADOS[of.estado]);
+}
+/** Cantidad de componentes de la LDP de esta OF con faltante real (ni
+ * reservado ni disponible alcanza) — usado en la cola de Producción. */
+function ofFaltantesCount(of) {
+  if (["COMPLETADA", "CANCELADA"].includes(of.estado)) return 0;
+  return ofNeedsRows(of).filter((r) => r.faltante > 0).length;
+}
+
 function depositoLocations() {
   return state.locations.filter((l) => l.type === "deposito");
 }
@@ -6923,7 +6953,7 @@ async function createLdpVersionSnapshot(boxConfigId) {
  * y genera un número único con reintentos acotados ante una colisión real
  * de la restricción unique de `numero` (dos usuarios creando a la vez). */
 async function createManufacturingOrder(opts) {
-  const { boxConfigId, cantidadPlanificada, fechaPlanificacion, fechaPrevista, almacenOrigenId, almacenIntermedioId, notes, customerId } = opts;
+  const { boxConfigId, cantidadPlanificada, fechaPlanificacion, fechaPrevista, almacenOrigenId, almacenIntermedioId, notes, customerId, prioridad, usuarioResponsable } = opts;
   if (!(cantidadPlanificada > 0)) throw new Error("La cantidad planificada debe ser mayor a 0");
   const ldpVersion = await createLdpVersionSnapshot(boxConfigId);
   const usuario = state.session?.user?.email || "Operador";
@@ -6935,11 +6965,12 @@ async function createManufacturingOrder(opts) {
       id: uid("of"), numero, boxConfigId, ldpVersionId: ldpVersion.id,
       cantidadPlanificada, cantidadProducida: 0, estado: "BORRADOR",
       fechaCreacion: nowISO(), fechaPlanificacion: fechaPlanificacion || null, fechaPrevista: fechaPrevista || null,
-      fechaInicio: null, fechaCierre: null, createdBy: usuario, usuarioResponsable: usuario,
+      fechaInicio: null, fechaCierre: null, createdBy: usuario, usuarioResponsable: usuarioResponsable || usuario,
       almacenOrigenId: almacenOrigenId || null, almacenIntermedioId: almacenIntermedioId || null,
       motivoPausa: null, motivoBloqueo: null, codigoBarras: numero, notes: notes || "",
       customerId: customer?.id || null, customerName: customer?.name || null,
       productoTerminadoId: null, loteTerminadoId: null,
+      prioridad: (prioridad && OF_PRIORIDADES[prioridad]) ? prioridad : "NORMAL", estadoPrevio: null,
     };
     try {
       const savedRec = await saveRecord("manufacturing_orders", rec);
@@ -7079,6 +7110,14 @@ async function setOfEstado(ofId, nuevoEstado, opts = {}) {
   if ((nuevoEstado === "PAUSADA" || nuevoEstado === "BLOQUEADA") && !opts.motivo) throw new Error("Se requiere un motivo");
   const estadoAnterior = of.estado;
   const rec = { ...of, estado: nuevoEstado };
+  // Guarda el estado real previo a pausar/bloquear (RESERVADA o EN_PRODUCCION)
+  // para poder restaurarlo exactamente al reanudar/desbloquear, en vez de
+  // volver siempre a PLANIFICADA (que perdía la etapa real en la que estaba).
+  if (nuevoEstado === "PAUSADA" || nuevoEstado === "BLOQUEADA") {
+    rec.estadoPrevio = ["PAUSADA", "BLOQUEADA"].includes(estadoAnterior) ? (of.estadoPrevio || "RESERVADA") : estadoAnterior;
+  } else {
+    rec.estadoPrevio = null;
+  }
   if (nuevoEstado === "PAUSADA") rec.motivoPausa = opts.motivo;
   if (nuevoEstado === "BLOQUEADA") rec.motivoBloqueo = opts.motivo;
   if (nuevoEstado !== "PAUSADA") rec.motivoPausa = null;
@@ -7092,22 +7131,66 @@ async function setOfEstado(ofId, nuevoEstado, opts = {}) {
   renderApp();
 }
 
-let ofListTab = "hoy"; // "hoy" | "todas"
-let ofHoyFilter = "hoy"; // "hoy" | "manana" | "proximas" | "en_produccion" | "bloqueadas" | "completadas"
+/** Cambia sólo la prioridad de una OF (independiente del estado/fecha —
+ * punto 6 de la integración) y deja registro de auditoría. */
+async function setOfPrioridad(ofId, prioridad) {
+  const of = getById("manufacturing_orders", ofId);
+  if (!of) return;
+  if (!OF_PRIORIDADES[prioridad]) throw new Error("Prioridad inválida");
+  if (of.prioridad === prioridad) return;
+  const anterior = of.prioridad || "NORMAL";
+  await persist("manufacturing_orders", { ...of, prioridad });
+  await persist("production_audit_log", {
+    id: uid("aud"), manufacturingOrderId: of.id, productId: null, operacion: "cambio_prioridad",
+    usuario: state.session?.user?.email || "Operador",
+    infoAnterior: { prioridad: anterior }, infoNueva: { prioridad }, notas: "",
+  });
+  toast(`OF ${of.numero}: prioridad → ${OF_PRIORIDADES[prioridad].label}`);
+  renderApp();
+}
+
+/** Inicia formalmente la producción de una OF ya reservada (punto 11 de la
+ * integración): valida estado y que no haya faltantes reales (defensivo —
+ * reservarStockOF() ya sólo deja RESERVADA sin faltantes, pero el stock
+ * pudo moverse desde entonces por otra operación). Pasa RESERVADA →
+ * EN_PRODUCCION con auditoría propia ("inicio_produccion"), independiente
+ * del auto-inicio que registrarConsumoOF() ya hacía en el primer escaneo
+ * (ambos caminos conviven: el explícito y el implícito al escanear). */
+async function iniciarProduccionOF(ofId) {
+  const of = getById("manufacturing_orders", ofId);
+  if (!of) throw new Error("OF no encontrada");
+  if (of.estado !== "RESERVADA") throw new Error("La OF debe estar Reservada para iniciar producción");
+  const faltantes = ofNeedsRows(of).filter((r) => r.faltante > 0);
+  if (faltantes.length) throw new Error(`No se puede iniciar: faltan ${faltantes.map((r) => r.nombre).join(", ")}`);
+  const usuario = state.session?.user?.email || "Operador";
+  await persist("manufacturing_orders", { ...of, estado: "EN_PRODUCCION", fechaInicio: of.fechaInicio || nowISO() });
+  await persist("production_audit_log", {
+    id: uid("aud"), manufacturingOrderId: of.id, productId: null, operacion: "inicio_produccion", usuario,
+    infoAnterior: { estado: "RESERVADA" }, infoNueva: { estado: "EN_PRODUCCION" },
+    notas: of.almacenIntermedioId ? `Traslado conceptual: ${locName(of.almacenOrigenId)} → ${locName(of.almacenIntermedioId)}` : "",
+  });
+  toast(`OF ${of.numero}: En producción`);
+  renderApp();
+}
+
+let ofListTab = "hoy"; // "hoy" | "todas" (no usado ya por el listado de planificación; se deja por compatibilidad de datos en memoria)
+let ofHoyFilter = "hoy"; // "hoy" | "manana" | "proximas" | "en_produccion" | "pausadas" | "bloqueadas" | "completadas" | "todas"
 const OF_HOY_FILTERS = [
   { key: "hoy", label: "Hoy" },
   { key: "manana", label: "Mañana" },
   { key: "proximas", label: "Próximas" },
   { key: "en_produccion", label: "En producción" },
+  { key: "pausadas", label: "Pausadas" },
   { key: "bloqueadas", label: "Bloqueadas" },
   { key: "completadas", label: "Completadas" },
+  { key: "todas", label: "Todas" },
 ];
 
-/** KPIs del panel "Producción Hoy": OF de hoy, cajas que faltan producir
- * hoy, OF en producción, bloqueadas, completadas hoy, OF con algún
- * componente realmente faltante (ni reservado ni disponible alcanza), y
- * cuántos productos distintos tienen stock reservado para producción en
- * este momento. */
+/** KPIs de la cola de ejecución de Producción: OF de hoy, cajas que faltan
+ * producir hoy, OF en producción, pausadas, bloqueadas, completadas hoy, OF
+ * con algún componente realmente faltante (ni reservado ni disponible
+ * alcanza), y cuántos productos distintos tienen stock reservado para
+ * producción en este momento. */
 function ofDashboardStats() {
   const orders = state.manufacturing_orders;
   const today = todayISO();
@@ -7115,11 +7198,12 @@ function ofDashboardStats() {
   const hoyOrders = orders.filter((o) => fecha(o) === today);
   const cajasAProducir = hoyOrders.reduce((s, o) => s + Math.max(0, (o.cantidadPlanificada || 0) - (o.cantidadProducida || 0)), 0);
   const enProduccion = orders.filter((o) => o.estado === "EN_PRODUCCION").length;
+  const pausadas = orders.filter((o) => o.estado === "PAUSADA").length;
   const bloqueadas = orders.filter((o) => o.estado === "BLOQUEADA").length;
   const completadasHoy = orders.filter((o) => o.estado === "COMPLETADA" && (o.fechaCierre || "").slice(0, 10) === today).length;
   const conFaltantes = orders.filter((o) => !["COMPLETADA", "CANCELADA"].includes(o.estado) && ofNeedsRows(o).some((r) => r.faltante > 0)).length;
   const productosReservados = new Set(state.production_reservations.filter((r) => r.estado === "RESERVADO").map((r) => r.productId)).size;
-  return { ofHoy: hoyOrders.length, cajasAProducir, enProduccion, bloqueadas, completadasHoy, conFaltantes, productosReservados };
+  return { ofHoy: hoyOrders.length, cajasAProducir, enProduccion, pausadas, bloqueadas, completadasHoy, conFaltantes, productosReservados };
 }
 
 function ofHoyFilteredOrders() {
@@ -7133,49 +7217,115 @@ function ofHoyFilteredOrders() {
   if (ofHoyFilter === "manana") return orders.filter((o) => fecha(o) === tomorrow);
   if (ofHoyFilter === "proximas") return orders.filter((o) => fecha(o) > today);
   if (ofHoyFilter === "en_produccion") return orders.filter((o) => o.estado === "EN_PRODUCCION");
+  if (ofHoyFilter === "pausadas") return orders.filter((o) => o.estado === "PAUSADA");
   if (ofHoyFilter === "bloqueadas") return orders.filter((o) => o.estado === "BLOQUEADA");
   if (ofHoyFilter === "completadas") return orders.filter((o) => o.estado === "COMPLETADA");
   return orders;
 }
 
-/** Panel "Producción Hoy": KPIs operativos del día + filtros rápidos.
- * Clickear una OF de la tabla abre su detalle (mismo link que en "Todas"). */
+/** Botonera de acciones de la cola de ejecución (punto 7 de la
+ * integración): "Ver" siempre abre el expediente completo de la OF (ahí
+ * viven escaneo/consumo/sustitución, que no se duplican acá); el resto de
+ * botones dispara las mismas acciones ya usadas en el expediente. */
+function ofQueueActions(of) {
+  const btns = [`<a href="#/of_produccion/${of.id}" class="btn btn-ghost btn-sm" title="Ver expediente completo">👁️ Ver</a>`];
+  if (of.estado === "RESERVADA") btns.push(`<button class="btn btn-primary btn-sm" data-action="of-iniciar" data-id="${of.id}">▶️ Iniciar</button>`);
+  if (of.estado === "EN_PRODUCCION") btns.push(`<a href="#/of_produccion/${of.id}" class="btn btn-secondary btn-sm">↪️ Continuar</a>`);
+  if (of.estado === "PAUSADA") btns.push(`<button class="btn btn-primary btn-sm" data-action="of-reanudar" data-id="${of.id}">▶️ Reanudar</button>`);
+  if (of.estado === "BLOQUEADA") btns.push(`<button class="btn btn-primary btn-sm" data-action="of-desbloquear" data-id="${of.id}">🔓 Desbloquear</button>`);
+  if (["RESERVADA", "EN_PRODUCCION"].includes(of.estado)) {
+    btns.push(`<button class="btn btn-ghost btn-sm" data-action="of-pausar" data-id="${of.id}">⏸ Pausar</button>`);
+    btns.push(`<button class="btn btn-ghost btn-sm" data-action="of-bloquear" data-id="${of.id}">⛔ Bloquear</button>`);
+  }
+  if (of.estado !== "BORRADOR") btns.push(`<a href="#/of_produccion/${of.id}/imprimir" class="btn btn-ghost btn-sm" title="Imprimir OF">🖨️</a>`);
+  if (of.loteTerminadoId) btns.push(`<a href="#/of_produccion/${of.id}/etiqueta" class="btn btn-ghost btn-sm" title="Imprimir etiqueta">🏷️</a>`);
+  if (!["COMPLETADA", "CANCELADA"].includes(of.estado) && ofClosingCheck(of).ready) btns.push(`<button class="btn btn-primary btn-sm" data-action="of-cerrar" data-id="${of.id}">✅ Cerrar</button>`);
+  return btns.join(" ");
+}
+
+/** Detalle de motivo/usuario/fecha para Pausadas o Bloqueadas (punto 10 de
+ * la integración) — el resto de columnas ya está en la tabla principal. */
+function ofPausadasBloqueadasDetalle(filtered, tipo) {
+  if (!filtered.length) return "";
+  return `<div class="panel" style="margin-top:12px">
+    <div class="panel-head"><h3>${tipo === "PAUSADA" ? "⏸ Detalle de pausas" : "⛔ Detalle de bloqueos"}</h3></div>
+    <div style="overflow-x:auto"><table class="mini-table">
+      <thead><tr><th>OF</th><th>Producto</th><th>Motivo</th><th>Usuario</th><th>Fecha/hora</th><th>Estado</th></tr></thead>
+      <tbody>${filtered.map((o) => {
+        const cfg = getById("box_configs", o.boxConfigId);
+        const productoFinal = cfg ? boxSizeLabel(cfg.size) : "—";
+        const lastAudit = state.production_audit_log
+          .filter((a) => a.manufacturingOrderId === o.id && a.operacion === "cambio_estado" && a.infoNueva?.estado === tipo)
+          .sort((a, b) => new Date(b.fecha || 0) - new Date(a.fecha || 0))[0];
+        return `<tr>
+          <td><a href="#/of_produccion/${o.id}" class="link-more">${esc(o.numero)}</a></td>
+          <td>${esc(productoFinal)}</td>
+          <td>${esc((tipo === "PAUSADA" ? o.motivoPausa : o.motivoBloqueo) || "—")}</td>
+          <td>${esc(lastAudit?.usuario || "—")}</td>
+          <td>${lastAudit ? fmtDateTime(lastAudit.fecha) : "—"}</td>
+          <td>${ofEstadoBadgeHtml(o)}</td>
+        </tr>`;
+      }).join("")}</tbody>
+    </table></div>
+  </div>`;
+}
+
+/** Cola de ejecución de Producción: KPIs operativos + filtros + tabla
+ * ordenada por PRIORIDAD → fecha planificada → número de OF (punto 6/7 de
+ * la integración, no por fecha de creación). Clickear "Ver" abre el
+ * expediente completo de la OF (viewOfDetail), que sigue siendo la única
+ * fuente de verdad — esta tabla sólo lee manufacturing_orders. */
 function viewOfHoy() {
   const stats = ofDashboardStats();
-  const filtered = [...ofHoyFilteredOrders()].sort((a, b) => new Date(b.fechaCreacion || 0) - new Date(a.fechaCreacion || 0));
+  const filtered = [...ofHoyFilteredOrders()].sort(compareOfQueue);
+  const showMotivo = ofHoyFilter === "pausadas" || ofHoyFilter === "bloqueadas";
   return `
     <div class="kpi-grid kpi-grid-compact" style="margin-bottom:16px">
       ${kpiCard(stats.ofHoy, "OF de hoy", "📅", "kpi-blue", 0)}
       ${kpiCard(stats.cajasAProducir, "Cajas a producir hoy", "📦", "kpi-violet", 40)}
       ${kpiCard(stats.enProduccion, "OF en producción", "⚙", "kpi-blue", 80)}
-      ${kpiCard(stats.bloqueadas, "OF bloqueadas", "⛔", stats.bloqueadas ? "kpi-red" : "kpi-blue", 120)}
-      ${kpiCard(stats.completadasHoy, "OF completadas hoy", "✅", "kpi-blue", 160)}
-      ${kpiCard(stats.conFaltantes, "OF con faltantes", "⚠", stats.conFaltantes ? "kpi-orange" : "kpi-blue", 200)}
-      ${kpiCard(stats.productosReservados, "Productos reservados", "🔒", "kpi-blue", 240)}
+      ${kpiCard(stats.pausadas, "OF pausadas", "⏸", stats.pausadas ? "kpi-orange" : "kpi-blue", 120)}
+      ${kpiCard(stats.bloqueadas, "OF bloqueadas", "⛔", stats.bloqueadas ? "kpi-red" : "kpi-blue", 160)}
+      ${kpiCard(stats.completadasHoy, "OF completadas hoy", "✅", "kpi-blue", 200)}
+      ${kpiCard(stats.conFaltantes, "OF con faltantes", "⚠", stats.conFaltantes ? "kpi-orange" : "kpi-blue", 240)}
+      ${kpiCard(stats.productosReservados, "Productos reservados", "🔒", "kpi-blue", 280)}
     </div>
     <div class="chip-row">
       ${OF_HOY_FILTERS.map((f) => `<button class="chip ${ofHoyFilter === f.key ? "active" : ""}" data-of-hoy-filter="${f.key}">${esc(f.label)}</button>`).join("")}
     </div>
     <div class="panel" style="margin-top:12px">
+      <div class="hint" style="margin-bottom:8px">Orden de la cola: prioridad → fecha planificada → número de OF.</div>
       <div style="overflow-x:auto"><table class="mini-table">
-        <thead><tr><th>Número</th><th>Producto final</th><th style="text-align:right">Planificada</th><th style="text-align:right">Producida</th><th>Estado</th><th>Fecha planificación</th></tr></thead>
+        <thead><tr><th>Prioridad</th><th>OF</th><th>Producto</th><th style="text-align:right">Cantidad</th><th style="text-align:right">Producido</th><th>Fecha</th><th>Estado</th><th>Faltantes</th><th>Responsable</th><th>Acciones</th></tr></thead>
         <tbody>${filtered.length ? filtered.map((o) => {
           const cfg = getById("box_configs", o.boxConfigId);
           const productoFinal = cfg ? `${esc(boxSizeLabel(cfg.size))}${cfg.name ? " — " + esc(cfg.name) : ""}` : "—";
+          const falt = ofFaltantesCount(o);
           return `<tr>
+            <td><select class="input input-sm" data-of-prioridad="${o.id}" style="min-width:100px" ${["COMPLETADA", "CANCELADA"].includes(o.estado) ? "disabled" : ""}>${Object.entries(OF_PRIORIDADES).map(([k, v]) => `<option value="${k}" ${o.prioridad === k ? "selected" : ""}>${esc(v.label)}</option>`).join("")}</select></td>
             <td><a href="#/of_produccion/${o.id}" class="link-more">${esc(o.numero)}</a></td>
             <td>${productoFinal}</td>
             <td style="text-align:right">${o.cantidadPlanificada}</td>
             <td style="text-align:right">${o.cantidadProducida}</td>
-            <td>${statusBadge(OF_ESTADOS[o.estado])}</td>
             <td>${o.fechaPlanificacion ? fmtDate(o.fechaPlanificacion) : "—"}</td>
+            <td>${ofEstadoBadgeHtml(o)}</td>
+            <td>${falt ? `<span class="badge st-red">${falt}</span>` : `<span class="badge st-green">0</span>`}</td>
+            <td>${esc(o.usuarioResponsable || "—")}</td>
+            <td style="white-space:nowrap">${ofQueueActions(o)}</td>
           </tr>`;
-        }).join("") : `<tr><td colspan="6"><div class="hint">Sin OF para este filtro.</div></td></tr>`}</tbody>
+        }).join("") : `<tr><td colspan="10"><div class="hint">Sin OF para este filtro.</div></td></tr>`}</tbody>
       </table></div>
     </div>
+    ${showMotivo ? ofPausadasBloqueadasDetalle(filtered, ofHoyFilter === "pausadas" ? "PAUSADA" : "BLOQUEADA") : ""}
   `;
 }
 
+/** Módulo de PLANIFICACIÓN (integración Producción ↔ OF, punto 1): acá se
+ * decide qué fabricar, cuánto, para cuándo y con qué prioridad. La cola de
+ * ejecución del día a día (iniciar, escanear, consumir, pausar/bloquear,
+ * cerrar) vive en Producción (viewProduccionEjecucion/viewOfHoy) — ambas
+ * vistas leen la misma `state.manufacturing_orders`, no hay datos ni
+ * estados paralelos. */
 function viewOfProduccion() {
   const orders = state.manufacturing_orders;
   if (!orders.length) {
@@ -7189,19 +7339,8 @@ function viewOfProduccion() {
   const completadasHoy = orders.filter((o) => o.estado === "COMPLETADA" && (o.fechaCierre || "").slice(0, 10) === todayISO()).length;
   const sorted = [...orders].sort((a, b) => new Date(b.fechaCreacion || 0) - new Date(a.fechaCreacion || 0));
   return `<div class="view-list">
-    <div class="list-toolbar"><h3 class="muted-title">Órdenes de Fabricación</h3><button class="btn btn-primary" data-action="open-modal" data-modal="of-new">+ Nueva OF</button></div>
-    <div class="panel" style="margin-bottom:16px">
-      <div class="panel-head"><h3>🔎 Identificar OF por código de barras</h3></div>
-      <form data-form="of-buscar-codigo" class="form-grid" style="align-items:end">
-        <label class="span2">Escaneá el código de la OF (o escribilo)<input class="input" name="codigo" id="of-buscar-input" autocomplete="off" /></label>
-        <div><button type="submit" class="btn btn-secondary">Buscar</button></div>
-      </form>
-    </div>
-    <div class="chip-row" style="margin-bottom:16px">
-      <button class="chip ${ofListTab === "hoy" ? "active" : ""}" data-of-tab="hoy">Producción Hoy</button>
-      <button class="chip ${ofListTab === "todas" ? "active" : ""}" data-of-tab="todas">Todas las OF (${orders.length})</button>
-    </div>
-    ${ofListTab === "hoy" ? viewOfHoy() : `
+    <div class="list-toolbar"><h3 class="muted-title">Órdenes de Fabricación — Planificación</h3><button class="btn btn-primary" data-action="open-modal" data-modal="of-new">+ Nueva OF</button></div>
+    <div class="hint" style="margin-bottom:12px">Acá se decide qué fabricar, cuánto, para cuándo y con qué prioridad. La ejecución del día a día (iniciar, escanear, consumir, cerrar) se hace desde <a href="#/produccion">Producción</a> — es la misma OF en las dos pantallas.</div>
     <div class="kpi-grid kpi-grid-compact" style="margin-bottom:16px">
       ${kpiCard(orders.length, "OF totales", "🏭", "kpi-blue", 0)}
       ${kpiCard(enCurso, "En producción / reservadas", "⚙", "kpi-violet", 40)}
@@ -7210,21 +7349,23 @@ function viewOfProduccion() {
     </div>
     <div class="panel">
       <div style="overflow-x:auto"><table class="mini-table">
-        <thead><tr><th>Número</th><th>Producto final</th><th style="text-align:right">Cant. planificada</th><th style="text-align:right">Cant. producida</th><th>Estado</th><th>Fecha creación</th></tr></thead>
+        <thead><tr><th>Número</th><th>Producto final</th><th>Cliente</th><th>Prioridad</th><th style="text-align:right">Cant. planificada</th><th style="text-align:right">Cant. producida</th><th>Estado</th><th>Fecha creación</th></tr></thead>
         <tbody>${sorted.map((o) => {
           const cfg = getById("box_configs", o.boxConfigId);
           const productoFinal = cfg ? `${esc(boxSizeLabel(cfg.size))}${cfg.name ? " — " + esc(cfg.name) : ""}` : "—";
           return `<tr>
             <td><a href="#/of_produccion/${o.id}" class="link-more">${esc(o.numero)}</a></td>
             <td>${productoFinal}</td>
+            <td>${o.customerName ? esc(o.customerName) : "—"}</td>
+            <td>${statusBadge(OF_PRIORIDADES[o.prioridad] || OF_PRIORIDADES.NORMAL)}</td>
             <td style="text-align:right">${o.cantidadPlanificada}</td>
             <td style="text-align:right">${o.cantidadProducida}</td>
-            <td>${statusBadge(OF_ESTADOS[o.estado])}</td>
+            <td>${ofEstadoBadgeHtml(o)}</td>
             <td>${fmtDateTime(o.fechaCreacion)}</td>
           </tr>`;
         }).join("")}</tbody>
       </table></div>
-    </div>`}
+    </div>
   </div>`;
 }
 
@@ -7249,6 +7390,7 @@ function viewOfDetail(id) {
   const actions = [];
   if (of.estado === "BORRADOR") actions.push(`<button class="btn btn-primary" data-action="of-planificar" data-id="${of.id}">Planificar</button>`);
   if (of.estado === "PLANIFICADA") actions.push(`<button class="btn btn-primary" data-action="of-reservar" data-id="${of.id}">Reservar stock</button>`);
+  if (of.estado === "RESERVADA") actions.push(`<button class="btn btn-primary" data-action="of-iniciar" data-id="${of.id}">▶️ Iniciar producción</button>`);
   if (["PLANIFICADA", "RESERVADA", "EN_PRODUCCION"].includes(of.estado)) {
     actions.push(`<button class="btn btn-secondary" data-action="of-pausar" data-id="${of.id}">Pausar</button>`);
     actions.push(`<button class="btn btn-secondary" data-action="of-bloquear" data-id="${of.id}">Bloquear</button>`);
@@ -7263,7 +7405,7 @@ function viewOfDetail(id) {
   <div class="detail-view">
     <div class="detail-head">
       <div><a href="#/of_produccion" class="back-link">← Órdenes de Fabricación</a><h2>${esc(of.numero)}</h2>
-        <div class="detail-sub">${productoFinal} ${statusBadge(OF_ESTADOS[of.estado])}</div>
+        <div class="detail-sub">${productoFinal} ${ofEstadoBadgeHtml(of)} ${statusBadge(OF_PRIORIDADES[of.prioridad] || OF_PRIORIDADES.NORMAL)}</div>
       </div>
       <div class="detail-actions">${actions.join("")}</div>
     </div>
@@ -7282,6 +7424,8 @@ function viewOfDetail(id) {
           <div><button type="submit" class="btn btn-secondary">Registrar avance</button></div>
         </form>` : ""}
         <div class="kv"><span>Cliente</span><b>${of.customerName ? esc(of.customerName) : "—"}</b></div>
+        <div class="kv"><span>Prioridad</span><b><select class="input" data-of-prioridad="${of.id}" style="max-width:160px;display:inline-block" ${["COMPLETADA", "CANCELADA"].includes(of.estado) ? "disabled" : ""}>${Object.entries(OF_PRIORIDADES).map(([k, v]) => `<option value="${k}" ${of.prioridad === k ? "selected" : ""}>${esc(v.label)}</option>`).join("")}</select></b></div>
+        <div class="kv"><span>Responsable</span><b>${of.usuarioResponsable ? esc(of.usuarioResponsable) : "—"}</b></div>
         <div class="kv"><span>Almacén origen</span><b>${of.almacenOrigenId ? esc(locName(of.almacenOrigenId)) : "—"}</b></div>
         <div class="kv"><span>Almacén intermedio</span><b>${of.almacenIntermedioId ? esc(locName(of.almacenIntermedioId)) : "—"}</b></div>
         ${of.notes ? `<div class="kv-notes"><span>Notas</span><p>${esc(of.notes)}</p></div>` : ""}
