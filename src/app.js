@@ -6084,7 +6084,7 @@ function renderMain() {
   if (r.view === "inventario") return viewInventario();
   if (r.view === "producto") return viewInventarioProductoDetail(r.id);
   if (r.view === "produccion") return r.id ? viewProduccionOrderDetail(r.id) : viewProduccion();
-  if (r.view === "of_produccion") return r.id ? viewOfDetail(r.id) : viewOfProduccion();
+  if (r.view === "of_produccion") return r.id ? (r.sub === "imprimir" ? viewOfImprimir(r.id) : viewOfDetail(r.id)) : viewOfProduccion();
   if (r.view === "incidencias") return r.id === "nueva" ? incidentForm() : r.id ? incidentDetail(r.id) : viewIncidencias();
   if (r.view === "tareas") return viewTareas();
   if (r.view === "reportes") return viewReportes();
@@ -6516,6 +6516,12 @@ function bindGlobalEvents() {
       })();
       return;
     }
+    const ofImprimirBtn = e.target.closest('[data-action="of-imprimir-ahora"]');
+    if (ofImprimirBtn) { window.print(); return; }
+    const ofListTabBtn = e.target.closest("[data-of-tab]");
+    if (ofListTabBtn) { ofListTab = ofListTabBtn.dataset.ofTab; renderMainOnly(); return; }
+    const ofHoyFilterBtn = e.target.closest("[data-of-hoy-filter]");
+    if (ofHoyFilterBtn) { ofHoyFilter = ofHoyFilterBtn.dataset.ofHoyFilter; renderMainOnly(); return; }
     const ofScanCameraBtn = e.target.closest('[data-action="of-scan-camera"]');
     if (ofScanCameraBtn) {
       const ofId = ofScanCameraBtn.dataset.id;
@@ -7058,6 +7064,90 @@ async function setOfEstado(ofId, nuevoEstado, opts = {}) {
   renderApp();
 }
 
+let ofListTab = "hoy"; // "hoy" | "todas"
+let ofHoyFilter = "hoy"; // "hoy" | "manana" | "proximas" | "en_produccion" | "bloqueadas" | "completadas"
+const OF_HOY_FILTERS = [
+  { key: "hoy", label: "Hoy" },
+  { key: "manana", label: "Mañana" },
+  { key: "proximas", label: "Próximas" },
+  { key: "en_produccion", label: "En producción" },
+  { key: "bloqueadas", label: "Bloqueadas" },
+  { key: "completadas", label: "Completadas" },
+];
+
+/** KPIs del panel "Producción Hoy": OF de hoy, cajas que faltan producir
+ * hoy, OF en producción, bloqueadas, completadas hoy, OF con algún
+ * componente realmente faltante (ni reservado ni disponible alcanza), y
+ * cuántos productos distintos tienen stock reservado para producción en
+ * este momento. */
+function ofDashboardStats() {
+  const orders = state.manufacturing_orders;
+  const today = todayISO();
+  const fecha = (o) => (o.fechaPlanificacion || o.fechaCreacion || "").slice(0, 10);
+  const hoyOrders = orders.filter((o) => fecha(o) === today);
+  const cajasAProducir = hoyOrders.reduce((s, o) => s + Math.max(0, (o.cantidadPlanificada || 0) - (o.cantidadProducida || 0)), 0);
+  const enProduccion = orders.filter((o) => o.estado === "EN_PRODUCCION").length;
+  const bloqueadas = orders.filter((o) => o.estado === "BLOQUEADA").length;
+  const completadasHoy = orders.filter((o) => o.estado === "COMPLETADA" && (o.fechaCierre || "").slice(0, 10) === today).length;
+  const conFaltantes = orders.filter((o) => !["COMPLETADA", "CANCELADA"].includes(o.estado) && ofNeedsRows(o).some((r) => r.faltante > 0)).length;
+  const productosReservados = new Set(state.production_reservations.filter((r) => r.estado === "RESERVADO").map((r) => r.productId)).size;
+  return { ofHoy: hoyOrders.length, cajasAProducir, enProduccion, bloqueadas, completadasHoy, conFaltantes, productosReservados };
+}
+
+function ofHoyFilteredOrders() {
+  const orders = state.manufacturing_orders;
+  const today = todayISO();
+  const tomorrowDate = new Date();
+  tomorrowDate.setDate(tomorrowDate.getDate() + 1);
+  const tomorrow = tomorrowDate.toISOString().slice(0, 10);
+  const fecha = (o) => (o.fechaPlanificacion || o.fechaCreacion || "").slice(0, 10);
+  if (ofHoyFilter === "hoy") return orders.filter((o) => fecha(o) === today);
+  if (ofHoyFilter === "manana") return orders.filter((o) => fecha(o) === tomorrow);
+  if (ofHoyFilter === "proximas") return orders.filter((o) => fecha(o) > today);
+  if (ofHoyFilter === "en_produccion") return orders.filter((o) => o.estado === "EN_PRODUCCION");
+  if (ofHoyFilter === "bloqueadas") return orders.filter((o) => o.estado === "BLOQUEADA");
+  if (ofHoyFilter === "completadas") return orders.filter((o) => o.estado === "COMPLETADA");
+  return orders;
+}
+
+/** Panel "Producción Hoy": KPIs operativos del día + filtros rápidos.
+ * Clickear una OF de la tabla abre su detalle (mismo link que en "Todas"). */
+function viewOfHoy() {
+  const stats = ofDashboardStats();
+  const filtered = [...ofHoyFilteredOrders()].sort((a, b) => new Date(b.fechaCreacion || 0) - new Date(a.fechaCreacion || 0));
+  return `
+    <div class="kpi-grid kpi-grid-compact" style="margin-bottom:16px">
+      ${kpiCard(stats.ofHoy, "OF de hoy", "📅", "kpi-blue", 0)}
+      ${kpiCard(stats.cajasAProducir, "Cajas a producir hoy", "📦", "kpi-violet", 40)}
+      ${kpiCard(stats.enProduccion, "OF en producción", "⚙", "kpi-blue", 80)}
+      ${kpiCard(stats.bloqueadas, "OF bloqueadas", "⛔", stats.bloqueadas ? "kpi-red" : "kpi-blue", 120)}
+      ${kpiCard(stats.completadasHoy, "OF completadas hoy", "✅", "kpi-blue", 160)}
+      ${kpiCard(stats.conFaltantes, "OF con faltantes", "⚠", stats.conFaltantes ? "kpi-orange" : "kpi-blue", 200)}
+      ${kpiCard(stats.productosReservados, "Productos reservados", "🔒", "kpi-blue", 240)}
+    </div>
+    <div class="chip-row">
+      ${OF_HOY_FILTERS.map((f) => `<button class="chip ${ofHoyFilter === f.key ? "active" : ""}" data-of-hoy-filter="${f.key}">${esc(f.label)}</button>`).join("")}
+    </div>
+    <div class="panel" style="margin-top:12px">
+      <div style="overflow-x:auto"><table class="mini-table">
+        <thead><tr><th>Número</th><th>Producto final</th><th style="text-align:right">Planificada</th><th style="text-align:right">Producida</th><th>Estado</th><th>Fecha planificación</th></tr></thead>
+        <tbody>${filtered.length ? filtered.map((o) => {
+          const cfg = getById("box_configs", o.boxConfigId);
+          const productoFinal = cfg ? `${esc(boxSizeLabel(cfg.size))}${cfg.name ? " — " + esc(cfg.name) : ""}` : "—";
+          return `<tr>
+            <td><a href="#/of_produccion/${o.id}" class="link-more">${esc(o.numero)}</a></td>
+            <td>${productoFinal}</td>
+            <td style="text-align:right">${o.cantidadPlanificada}</td>
+            <td style="text-align:right">${o.cantidadProducida}</td>
+            <td>${statusBadge(OF_ESTADOS[o.estado])}</td>
+            <td>${o.fechaPlanificacion ? fmtDate(o.fechaPlanificacion) : "—"}</td>
+          </tr>`;
+        }).join("") : `<tr><td colspan="6"><div class="hint">Sin OF para este filtro.</div></td></tr>`}</tbody>
+      </table></div>
+    </div>
+  `;
+}
+
 function viewOfProduccion() {
   const orders = state.manufacturing_orders;
   if (!orders.length) {
@@ -7079,6 +7169,11 @@ function viewOfProduccion() {
         <div><button type="submit" class="btn btn-secondary">Buscar</button></div>
       </form>
     </div>
+    <div class="chip-row" style="margin-bottom:16px">
+      <button class="chip ${ofListTab === "hoy" ? "active" : ""}" data-of-tab="hoy">Producción Hoy</button>
+      <button class="chip ${ofListTab === "todas" ? "active" : ""}" data-of-tab="todas">Todas las OF (${orders.length})</button>
+    </div>
+    ${ofListTab === "hoy" ? viewOfHoy() : `
     <div class="kpi-grid kpi-grid-compact" style="margin-bottom:16px">
       ${kpiCard(orders.length, "OF totales", "🏭", "kpi-blue", 0)}
       ${kpiCard(enCurso, "En producción / reservadas", "⚙", "kpi-violet", 40)}
@@ -7101,7 +7196,7 @@ function viewOfProduccion() {
           </tr>`;
         }).join("")}</tbody>
       </table></div>
-    </div>
+    </div>`}
   </div>`;
 }
 
@@ -7134,6 +7229,7 @@ function viewOfDetail(id) {
   if (of.estado === "BLOQUEADA") actions.push(`<button class="btn btn-primary" data-action="of-desbloquear" data-id="${of.id}">Desbloquear</button>`);
   if (!["COMPLETADA", "CANCELADA"].includes(of.estado)) actions.push(`<button class="btn btn-ghost" data-action="of-cancelar" data-id="${of.id}">Cancelar OF</button>`);
   if (!["COMPLETADA", "CANCELADA"].includes(of.estado) && closingCheck.ready) actions.push(`<button class="btn btn-primary" data-action="of-cerrar" data-id="${of.id}">🟢 Cerrar OF</button>`);
+  actions.push(`<a href="#/of_produccion/${of.id}/imprimir" class="btn btn-ghost">🖨️ Imprimir</a>`);
   return `
   <div class="detail-view">
     <div class="detail-head">
@@ -7244,6 +7340,64 @@ function viewOfDetail(id) {
 /** Busca un producto por EAN-13 (prioridad) o por SKU — ambos son válidos
  * para escanear, ya que no todos los productos van a tener EAN-13 cargado
  * todavía. */
+/** Vista de impresión de una OF — de sólo lectura (no llama a persist() ni
+ * a ningún RPC en ningún momento: reimprimir nunca crea una OF nueva ni
+ * modifica stock). Pensada para window.print() nativo del navegador, en A4
+ * y legible en blanco y negro. El identificador de la OF se imprime como
+ * texto grande y con espaciado (no como gráfico de código de barras: eso
+ * requeriría una librería externa que este entorno no puede instalar por
+ * ahora) — sigue siendo utilizable con el buscador de OF por código. */
+function viewOfImprimir(id) {
+  const of = getById("manufacturing_orders", id);
+  if (!of) return emptyState("🤔", "OF no encontrada", "");
+  const cfg = getById("box_configs", of.boxConfigId);
+  const ldpVersion = getById("ldp_versions", of.ldpVersionId);
+  const productoFinal = cfg ? `${esc(boxSizeLabel(cfg.size))}${cfg.name ? " — " + esc(cfg.name) : ""}` : "—";
+  const rows = ofNeedsRows(of);
+  return `
+    <div class="no-print" style="margin-bottom:16px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <a href="#/of_produccion/${of.id}" class="back-link">← Volver a la OF</a>
+      <button type="button" class="btn btn-primary" data-action="of-imprimir-ahora">🖨️ Imprimir / Guardar como PDF</button>
+    </div>
+    <div class="print-of">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;border-bottom:2px solid #000;padding-bottom:10px;margin-bottom:14px">
+        <div>
+          <div style="font-size:20px;font-weight:800">LOGÍSTICA PERONA</div>
+          <div style="font-size:13px">Orden de Fabricación</div>
+        </div>
+        <div style="text-align:right">
+          <div style="font-size:28px;font-weight:800;letter-spacing:3px;font-family:monospace">${esc(of.numero)}</div>
+          <div style="font-size:12px">${statusBadge(OF_ESTADOS[of.estado])}</div>
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 20px;margin-bottom:14px;font-size:13px">
+        <div><b>Producto final:</b> ${productoFinal}</div>
+        <div><b>Versión de LDP:</b> ${ldpVersion ? "Versión " + ldpVersion.version : "—"}</div>
+        <div><b>Cantidad planificada:</b> ${of.cantidadPlanificada}</div>
+        <div><b>Cantidad producida:</b> ${of.cantidadProducida}</div>
+        <div><b>Fecha de creación:</b> ${fmtDateTime(of.fechaCreacion)}</div>
+        <div><b>Fecha prevista:</b> ${of.fechaPrevista ? fmtDate(of.fechaPrevista) : "—"}</div>
+        <div><b>Almacén origen:</b> ${of.almacenOrigenId ? esc(locName(of.almacenOrigenId)) : "—"}</div>
+        <div><b>Almacén intermedio:</b> ${of.almacenIntermedioId ? esc(locName(of.almacenIntermedioId)) : "—"}</div>
+      </div>
+      <table class="mini-table" style="width:100%;border-collapse:collapse">
+        <thead><tr><th>Componente</th><th>EAN-13 / código</th><th style="text-align:right">Necesario</th><th style="text-align:right">Reservado</th><th style="text-align:right">Consumido</th><th style="text-align:right">Pendiente</th></tr></thead>
+        <tbody>${rows.map((r) => `<tr>
+          <td>${esc(r.nombre || "—")}${r.esSustituto ? " *" : ""}</td>
+          <td>${esc(r.ean13 || r.codigoInterno || "—")}</td>
+          <td style="text-align:right">${r.necesario}</td>
+          <td style="text-align:right">${r.reservadoOF}</td>
+          <td style="text-align:right">${r.consumido}</td>
+          <td style="text-align:right">${r.pendiente}</td>
+        </tr>`).join("")}</tbody>
+      </table>
+      ${rows.some((r) => r.esSustituto) ? `<div style="font-size:11px;margin-top:6px">* Producto de reemplazo (ver historial en el detalle de la OF).</div>` : ""}
+      ${of.notes ? `<div style="margin-top:12px;font-size:12px"><b>Notas:</b> ${esc(of.notes)}</div>` : ""}
+      <div style="margin-top:20px;font-size:11px;color:#666">Impreso: ${fmtDateTime(nowISO())} · Documento de sólo lectura — reimprimir no modifica la OF ni el stock.</div>
+    </div>
+  `;
+}
+
 function findProductByScanCode(code) {
   const c = (code || "").trim();
   if (!c) return null;
