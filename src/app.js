@@ -5113,11 +5113,16 @@ function openModal(kind, opts = {}) {
       </div>`;
     } else {
       const depositos = depositoLocations();
+      const clientesOf = state.customers;
       body = `<form data-form="of-new">
         <h3>Nueva Orden de Fabricación</h3>
         <div class="form-grid">
           <label class="span2">Producto final<select class="input" name="boxConfigId" required>
             ${finalOptions.map((opt) => `<option value="${opt.config.id}">${esc(boxSizeLabel(opt.size))}${opt.config.name ? " — " + esc(opt.config.name) : ""}</option>`).join("")}
+          </select></label>
+          <label class="span2">Cliente <span class="hint">(opcional — arma el número de lote del producto terminado: OF + cliente)</span><select class="input" name="customerId">
+            <option value="">— Sin cliente —</option>
+            ${clientesOf.map((c) => `<option value="${c.id}">${esc(c.name)}</option>`).join("")}
           </select></label>
           <label>Cantidad planificada<input class="input" type="number" name="cantidadPlanificada" min="1" step="1" required /></label>
           <label>Fecha de planificación<input class="input" type="date" name="fechaPlanificacion" value="${todayISO()}" /></label>
@@ -5514,7 +5519,7 @@ async function handleFormSubmit(form) {
         boxConfigId, cantidadPlanificada,
         fechaPlanificacion: val("fechaPlanificacion") || null, fechaPrevista: val("fechaPrevista") || null,
         almacenOrigenId: val("almacenOrigenId") || null, almacenIntermedioId: val("almacenIntermedioId") || null,
-        notes: val("notes"),
+        notes: val("notes"), customerId: val("customerId") || null,
       });
       closeModal(); toast(`OF ${rec.numero} creada`); location.hash = `#/of_produccion/${rec.id}`;
     } catch (e) {
@@ -6102,7 +6107,7 @@ function renderMain() {
   if (r.view === "inventario") return viewInventario();
   if (r.view === "producto") return viewInventarioProductoDetail(r.id);
   if (r.view === "produccion") return r.id ? viewProduccionOrderDetail(r.id) : viewProduccion();
-  if (r.view === "of_produccion") return r.id ? (r.sub === "imprimir" ? viewOfImprimir(r.id) : viewOfDetail(r.id)) : viewOfProduccion();
+  if (r.view === "of_produccion") return r.id ? (r.sub === "imprimir" ? viewOfImprimir(r.id) : r.sub === "etiqueta" ? viewOfEtiqueta(r.id) : viewOfDetail(r.id)) : viewOfProduccion();
   if (r.view === "incidencias") return r.id === "nueva" ? incidentForm() : r.id ? incidentDetail(r.id) : viewIncidencias();
   if (r.view === "tareas") return viewTareas();
   if (r.view === "reportes") return viewReportes();
@@ -6918,10 +6923,11 @@ async function createLdpVersionSnapshot(boxConfigId) {
  * y genera un número único con reintentos acotados ante una colisión real
  * de la restricción unique de `numero` (dos usuarios creando a la vez). */
 async function createManufacturingOrder(opts) {
-  const { boxConfigId, cantidadPlanificada, fechaPlanificacion, fechaPrevista, almacenOrigenId, almacenIntermedioId, notes } = opts;
+  const { boxConfigId, cantidadPlanificada, fechaPlanificacion, fechaPrevista, almacenOrigenId, almacenIntermedioId, notes, customerId } = opts;
   if (!(cantidadPlanificada > 0)) throw new Error("La cantidad planificada debe ser mayor a 0");
   const ldpVersion = await createLdpVersionSnapshot(boxConfigId);
   const usuario = state.session?.user?.email || "Operador";
+  const customer = customerId ? getById("customers", customerId) : null;
   let saved = null, lastErr = null;
   for (let attempt = 0; attempt < 8 && !saved; attempt++) {
     const numero = `OF-${String(state.manufacturing_orders.length + 1 + attempt).padStart(5, "0")}`;
@@ -6932,6 +6938,8 @@ async function createManufacturingOrder(opts) {
       fechaInicio: null, fechaCierre: null, createdBy: usuario, usuarioResponsable: usuario,
       almacenOrigenId: almacenOrigenId || null, almacenIntermedioId: almacenIntermedioId || null,
       motivoPausa: null, motivoBloqueo: null, codigoBarras: numero, notes: notes || "",
+      customerId: customer?.id || null, customerName: customer?.name || null,
+      productoTerminadoId: null, loteTerminadoId: null,
     };
     try {
       const savedRec = await saveRecord("manufacturing_orders", rec);
@@ -7250,6 +7258,7 @@ function viewOfDetail(id) {
   if (!["COMPLETADA", "CANCELADA"].includes(of.estado)) actions.push(`<button class="btn btn-ghost" data-action="of-cancelar" data-id="${of.id}">Cancelar OF</button>`);
   if (!["COMPLETADA", "CANCELADA"].includes(of.estado) && closingCheck.ready) actions.push(`<button class="btn btn-primary" data-action="of-cerrar" data-id="${of.id}">🟢 Cerrar OF</button>`);
   actions.push(`<a href="#/of_produccion/${of.id}/imprimir" class="btn btn-ghost">🖨️ Imprimir</a>`);
+  if (of.loteTerminadoId) actions.push(`<a href="#/of_produccion/${of.id}/etiqueta" class="btn btn-ghost">🏷️ Etiqueta</a>`);
   return `
   <div class="detail-view">
     <div class="detail-head">
@@ -7265,12 +7274,14 @@ function viewOfDetail(id) {
           <div class="stat-box"><b>${of.cantidadPlanificada}</b><span>Planificada</span></div>
           <div class="stat-box"><b>${of.cantidadProducida}</b><span>Producida</span></div>
           <div class="stat-box"><b>${ldpVersion ? "Versión " + ldpVersion.version : "—"}</b><span>LDP</span></div>
+          ${of.loteTerminadoId ? `<div class="stat-box"><b>${esc(getById("inventory_lots", of.loteTerminadoId)?.numeroLote || of.numero)}</b><span>Lote terminado</span></div>` : ""}
         </div>
         ${["RESERVADA", "EN_PRODUCCION"].includes(of.estado) ? `
         <form data-form="of-avance" data-id="${of.id}" class="form-grid" style="margin:10px 0;align-items:end">
           <label>Registrar avance (cajas terminadas)<input class="input" type="number" name="cantidad" min="1" step="1" placeholder="ej: 5" /></label>
           <div><button type="submit" class="btn btn-secondary">Registrar avance</button></div>
         </form>` : ""}
+        <div class="kv"><span>Cliente</span><b>${of.customerName ? esc(of.customerName) : "—"}</b></div>
         <div class="kv"><span>Almacén origen</span><b>${of.almacenOrigenId ? esc(locName(of.almacenOrigenId)) : "—"}</b></div>
         <div class="kv"><span>Almacén intermedio</span><b>${of.almacenIntermedioId ? esc(locName(of.almacenIntermedioId)) : "—"}</b></div>
         ${of.notes ? `<div class="kv-notes"><span>Notas</span><p>${esc(of.notes)}</p></div>` : ""}
@@ -7414,6 +7425,51 @@ function viewOfImprimir(id) {
       ${rows.some((r) => r.esSustituto) ? `<div style="font-size:11px;margin-top:6px">* Producto de reemplazo (ver historial en el detalle de la OF).</div>` : ""}
       ${of.notes ? `<div style="margin-top:12px;font-size:12px"><b>Notas:</b> ${esc(of.notes)}</div>` : ""}
       <div style="margin-top:20px;font-size:11px;color:#666">Impreso: ${fmtDateTime(nowISO())} · Documento de sólo lectura — reimprimir no modifica la OF ni el stock.</div>
+    </div>
+  `;
+}
+
+/** Etiqueta de producto terminado — de sólo lectura, imprimible, para
+ * pegar en la caja/pallet una vez cerrada la OF. Reutiliza el mismo
+ * svg#of-print-barcode + mountOfBarcodeIfPresent() que la vista de
+ * impresión de la OF (nunca están montadas las dos a la vez). Sólo existe
+ * una vez que la OF generó su lote (of.loteTerminadoId, seteado por
+ * cerrarOF()) — antes de cerrar no hay nada que etiquetar todavía. */
+function viewOfEtiqueta(id) {
+  const of = getById("manufacturing_orders", id);
+  if (!of) return emptyState("🤔", "OF no encontrada", "");
+  if (!of.loteTerminadoId) {
+    return emptyState("🏷️", "Todavía no hay etiqueta", "La etiqueta de producto terminado se genera automáticamente al cerrar la OF.", `<a href="#/of_produccion/${of.id}" class="btn btn-primary">← Volver a la OF</a>`);
+  }
+  const lot = getById("inventory_lots", of.loteTerminadoId);
+  const product = of.productoTerminadoId ? getById("products", of.productoTerminadoId) : (lot ? getById("products", lot.productId) : null);
+  const cfg = getById("box_configs", of.boxConfigId);
+  const productoFinal = product?.name || (cfg ? `Caja ${boxSizeLabel(cfg.size)}` : "—");
+  const numeroLote = lot?.numeroLote || of.numero;
+  return `
+    <div class="no-print" style="margin-bottom:16px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <a href="#/of_produccion/${of.id}" class="back-link">← Volver a la OF</a>
+      <button type="button" class="btn btn-primary" data-action="of-imprimir-ahora">🖨️ Imprimir / Guardar como PDF</button>
+    </div>
+    <div class="print-of" style="max-width:420px">
+      <div style="text-align:center;border-bottom:2px solid #000;padding-bottom:10px;margin-bottom:14px">
+        <div style="font-size:18px;font-weight:800">LOGÍSTICA PERONA</div>
+        <div style="font-size:13px">Etiqueta de producto terminado</div>
+      </div>
+      <div style="text-align:center;margin-bottom:14px">
+        <div style="font-size:20px;font-weight:800">${esc(productoFinal)}</div>
+        <div style="font-size:13px">Cantidad: <b>${lot?.quantity ?? of.cantidadProducida}</b> unidades</div>
+      </div>
+      <div style="display:grid;gap:6px;font-size:13px;margin-bottom:14px">
+        <div><b>Lote:</b> ${esc(numeroLote)}</div>
+        <div><b>OF de origen:</b> ${esc(of.numero)}</div>
+        <div><b>Cliente:</b> ${of.customerName ? esc(of.customerName) : "—"}</div>
+        <div><b>Fecha de elaboración:</b> ${lot?.fechaElaboracion ? fmtDate(lot.fechaElaboracion) : fmtDate(todayISO())}</div>
+      </div>
+      <div style="text-align:center">
+        <svg id="of-print-barcode" data-value="${esc(numeroLote)}" style="max-width:280px"></svg>
+      </div>
+      <div style="margin-top:20px;font-size:11px;color:#666;text-align:center">Impreso: ${fmtDateTime(nowISO())} · Documento de sólo lectura.</div>
     </div>
   `;
 }
@@ -7629,8 +7685,25 @@ function ofClosingCheck(of) {
   return { ready: reasons.length === 0, reasons };
 }
 
+/** Arma un slug legible en mayúsculas (sin tildes, sólo A-Z0-9 y guiones,
+ * sin guiones dobles ni al principio/final) para usar en códigos de lote.
+ * Devuelve "" si no hay texto. */
+function slugCodigo(text) {
+  return (text || "")
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
 /** Cierra formalmente una OF — sólo si ofClosingCheck() da luz verde;
- * nunca cierra "a la fuerza" ni con faltantes. */
+ * nunca cierra "a la fuerza" ni con faltantes. Además da de alta el
+ * producto terminado en Inventario: reutiliza EXACTAMENTE el mismo
+ * criterio que ya usa Producción simple (confirmProduction, sección 14.6)
+ * — mismo SKU "CAJA-<TAMAÑO>" y categoría "Caja terminada" — para que
+ * ambos flujos compartan un único producto por tamaño de caja en vez de
+ * duplicarlo, y crea un lote con número = OF + cliente (si la OF tiene
+ * cliente asignado; si no, sólo el número de OF). */
 async function cerrarOF(ofId) {
   const of = getById("manufacturing_orders", ofId);
   if (!of) throw new Error("OF no encontrada");
@@ -7638,12 +7711,49 @@ async function cerrarOF(ofId) {
   if (!check.ready) throw new Error("La OF no puede cerrarse: " + check.reasons.join("; "));
   const usuario = state.session?.user?.email || "Operador";
   const estadoAnterior = of.estado;
-  await persist("manufacturing_orders", { ...of, estado: "COMPLETADA", fechaCierre: nowISO() });
+
+  const cfg = getById("box_configs", of.boxConfigId);
+  const size = cfg?.size || "estandar";
+  const sku = `CAJA-${size.toUpperCase()}`;
+  let boxProduct = state.products.find((p) => p.sku === sku && p.categoria === "Caja terminada");
+  if (!boxProduct) {
+    boxProduct = {
+      id: uid("prd"), name: `Caja ${boxSizeLabel(size)}`, sku, categoria: "Caja terminada", supplierId: null,
+      unit: "und", packageSize: null, minQty: null, maxQty: null, optimalQty: null,
+      manejaLote: true, manejaVencimiento: false, diasAlerta: null,
+      notes: "Producto terminado generado automáticamente por el módulo de Producción.",
+    };
+    await persist("products", boxProduct);
+  }
+  const clienteSlug = slugCodigo(of.customerName);
+  const numeroLote = clienteSlug ? `${of.numero}-${clienteSlug}` : of.numero;
+  const cantidad = of.cantidadProducida || 0;
+  const boxLot = {
+    id: uid("lot"), productId: boxProduct.id, quantity: cantidad, cantidadInicial: cantidad, cantidadComprometida: 0,
+    numeroLote, fechaElaboracion: todayISO(), deposito: null, bloqueado: false, motivoBloqueo: null,
+    remito: null, ordenCompra: of.numero, fechaRecepcion: todayISO(), costoUnitario: null, expiryDate: null,
+  };
+  await persist("inventory_lots", boxLot);
+  await registerMovement({
+    productId: boxProduct.id, lotId: boxLot.id, type: "recepcion", quantity: cantidad, previousQty: 0, newQty: cantidad,
+    reason: `Cierre OF ${of.numero}${of.customerName ? " — Cliente: " + of.customerName : ""} — Caja ${boxSizeLabel(size)} x${cantidad}`,
+    relatedDocument: of.numero,
+  });
+
+  await persist("manufacturing_orders", {
+    ...of, estado: "COMPLETADA", fechaCierre: nowISO(),
+    productoTerminadoId: boxProduct.id, loteTerminadoId: boxLot.id,
+  });
   await persist("production_audit_log", {
     id: uid("aud"), manufacturingOrderId: of.id, productId: null, operacion: "cierre", usuario,
     infoAnterior: { estado: estadoAnterior }, infoNueva: { estado: "COMPLETADA" }, notas: "",
   });
-  toast(`OF ${of.numero} cerrada`);
+  await persist("production_audit_log", {
+    id: uid("aud"), manufacturingOrderId: of.id, productId: boxProduct.id, operacion: "alta_producto_terminado", usuario,
+    infoAnterior: null, infoNueva: { loteId: boxLot.id, numeroLote, cantidad }, notas: `Lote ${numeroLote} cargado en Inventario`,
+  });
+
+  toast(`OF ${of.numero} cerrada — lote ${numeroLote} cargado en Inventario`);
   renderApp();
 }
 
