@@ -14,6 +14,7 @@ import {
 import * as XLSXStyle from "xlsx-js-style";
 import { fmtMoney, expedicionStageFromStatus, haversineKm, transportRateCost, expedicionPuntuar, expedicionChecklist } from "./domain/expedicion.js";
 import { orderGeoPoint, transportBasePoint, computeOperationalKpis, nodeSummary, distinctValues, zoneCoverageMarkers, incidentGeoPoint } from "./domain/geo.js";
+import { cameraScanSupported, detectDeviceLabel, openCameraScan } from "./domain/barcode.js";
 
 /* ---------------------------------------------------------------------------
    0. UTILIDADES
@@ -2495,6 +2496,7 @@ const MOVEMENT_META = {
   bloqueo:         { label: "Bloqueo",         cls: "st-gray" },
   desbloqueo:      { label: "Desbloqueo",      cls: "st-gray" },
   produccion:      { label: "Salida por producción", cls: "st-violet" },
+  consumo_of:      { label: "Consumo (OF)", cls: "st-violet" },
 };
 const LOT_ESTADO_LABEL = { vencido: "Vencido", critico: "Crítico", proximo: "Próximo a vencer", ok: "Normal", bloqueado: "Bloqueado", agotado: "Agotado", sf: "Sin fecha" };
 
@@ -5500,6 +5502,31 @@ async function handleFormSubmit(form) {
     } catch (e) {
       toast(e.message || "No se pudo crear la OF", "warn");
     }
+  } else if (kind === "of-consumo") {
+    if (ofScanBusy) return;
+    ofScanBusy = true;
+    const ofId = form.dataset.id;
+    const codigo = val("codigo");
+    const cantidad = parseFloat(val("cantidad")) || 0;
+    try {
+      const result = await registrarConsumoOF(ofId, codigo, cantidad);
+      ofScanMessages[ofId] = { type: "ok", text: `${result.cantidad} × ${result.product.name} registrado` };
+      toast("Consumo registrado");
+    } catch (e) {
+      ofScanMessages[ofId] = { type: "err", text: e.message || "No se pudo registrar el consumo" };
+      toast(e.message || "No se pudo registrar el consumo", "warn");
+    } finally {
+      ofScanBusy = false;
+      renderMainOnly();
+    }
+  } else if (kind === "of-avance") {
+    const ofId = form.dataset.id;
+    const cantidad = parseFloat(val("cantidad")) || 0;
+    try {
+      await registrarAvanceProduccion(ofId, cantidad);
+    } catch (e) {
+      toast(e.message || "No se pudo registrar el avance", "warn");
+    }
   }
 }
 
@@ -6417,6 +6444,21 @@ function bindGlobalEvents() {
       })();
       return;
     }
+    const ofScanCameraBtn = e.target.closest('[data-action="of-scan-camera"]');
+    if (ofScanCameraBtn) {
+      const ofId = ofScanCameraBtn.dataset.id;
+      openCameraScan({
+        onResult: (code) => {
+          const input = document.getElementById("of-scan-input");
+          if (input) { input.value = code; input.closest("form")?.requestSubmit(); }
+        },
+        onClose: (reason) => {
+          if (reason === "unsupported") toast("Tu navegador no soporta lectura por cámara. Usá un lector USB/Bluetooth o escribí el código manualmente.", "warn");
+          if (reason === "permission_denied") toast("No se pudo acceder a la cámara (permiso denegado).", "warn");
+        },
+      });
+      return;
+    }
     const prodLineAddBtn = e.target.closest('[data-action="prod-line-add"]');
     if (prodLineAddBtn) {
       produccionPlan.lines.push({ id: uid("pline"), size: produccionNextUnusedSize(), quantity: 10 });
@@ -6807,24 +6849,32 @@ async function createManufacturingOrder(opts) {
   return saved;
 }
 
-/** Calcula, por producto de la LDP versionada de una OF, lo necesario,
- * disponible, ya reservado por esta OF, faltante y un estado resumen. */
+/** Calcula, por producto de la LDP versionada de una OF: lo necesario, lo
+ * disponible (stock libre no reservado por OTRA OF), lo reservado NETO para
+ * esta OF (reserva bruta menos lo ya consumido — así la tabla no muestra
+ * "reservado" algo que ya se consumió), lo consumido, lo pendiente y el
+ * faltante real, más un estado resumen. */
 function ofNeedsRows(of) {
   const items = state.ldp_version_items.filter((i) => i.ldpVersionId === of.ldpVersionId);
   return items.map((item) => {
     const necesario = item.cantidadRequerida * of.cantidadPlanificada;
-    const reservadoOF = state.production_reservations
+    const reservadoBruto = state.production_reservations
       .filter((r) => r.manufacturingOrderId === of.id && r.productId === item.productId && r.estado === "RESERVADO")
       .reduce((s, r) => s + (r.cantidad || 0), 0);
+    const consumido = state.production_consumptions
+      .filter((c) => c.manufacturingOrderId === of.id && c.productId === item.productId && c.tipo === "consumo")
+      .reduce((s, c) => s + (c.cantidad || 0), 0);
+    const reservadoOF = Math.max(0, reservadoBruto - consumido);
     const otrasReservas = state.production_reservations
       .filter((r) => r.productId === item.productId && r.estado === "RESERVADO" && r.manufacturingOrderId !== of.id)
       .reduce((s, r) => s + (r.cantidad || 0), 0);
     const disponible = Math.max(0, productTotalQty(item.productId) - otrasReservas);
-    const faltante = Math.max(0, necesario - reservadoOF - disponible);
-    const estado = reservadoOF >= necesario ? "completo" : (disponible >= necesario - reservadoOF ? "reservable" : "faltante");
+    const pendiente = Math.max(0, necesario - consumido);
+    const faltante = Math.max(0, pendiente - reservadoOF - disponible);
+    const estado = consumido >= necesario ? "completo" : (reservadoOF + disponible >= pendiente ? "reservable" : "faltante");
     return {
       productId: item.productId, nombre: item.nombre, codigoInterno: item.codigoInterno, ean13: item.ean13,
-      necesario, disponible, reservadoOF, faltante, estado,
+      necesario, disponible, reservadoOF, consumido, pendiente, faltante, estado,
     };
   });
 }
@@ -6974,6 +7024,11 @@ function viewOfDetail(id) {
           <div class="stat-box"><b>${of.cantidadProducida}</b><span>Producida</span></div>
           <div class="stat-box"><b>${ldpVersion ? "Versión " + ldpVersion.version : "—"}</b><span>LDP</span></div>
         </div>
+        ${["RESERVADA", "EN_PRODUCCION"].includes(of.estado) ? `
+        <form data-form="of-avance" data-id="${of.id}" class="form-grid" style="margin:10px 0;align-items:end">
+          <label>Registrar avance (cajas terminadas)<input class="input" type="number" name="cantidad" min="1" step="1" placeholder="ej: 5" /></label>
+          <div><button type="submit" class="btn btn-secondary">Registrar avance</button></div>
+        </form>` : ""}
         <div class="kv"><span>Almacén origen</span><b>${of.almacenOrigenId ? esc(locName(of.almacenOrigenId)) : "—"}</b></div>
         <div class="kv"><span>Almacén intermedio</span><b>${of.almacenIntermedioId ? esc(locName(of.almacenIntermedioId)) : "—"}</b></div>
         ${of.notes ? `<div class="kv-notes"><span>Notas</span><p>${esc(of.notes)}</p></div>` : ""}
@@ -6988,14 +7043,16 @@ function viewOfDetail(id) {
       </div>
       <div class="panel span2">
         <div class="panel-head"><h3>Necesidad de materiales</h3></div>
+        ${["RESERVADA", "EN_PRODUCCION"].includes(of.estado) ? viewOfScanPanel(of) : ""}
         <div style="overflow-x:auto"><table class="mini-table">
-          <thead><tr><th>Producto</th><th>EAN-13</th><th style="text-align:right">Necesario</th><th style="text-align:right">Disponible</th><th style="text-align:right">Reservado</th><th style="text-align:right">Faltante</th><th>Estado</th></tr></thead>
+          <thead><tr><th>Producto</th><th>EAN-13</th><th style="text-align:right">Necesario</th><th style="text-align:right">Disponible</th><th style="text-align:right">Reservado</th><th style="text-align:right">Consumido</th><th style="text-align:right">Faltante</th><th>Estado</th></tr></thead>
           <tbody>${rows.map((r) => `<tr>
             <td>${esc(r.nombre || "—")}</td>
             <td>${esc(r.ean13 || "—")}</td>
             <td style="text-align:right">${r.necesario}</td>
             <td style="text-align:right">${r.disponible}</td>
             <td style="text-align:right">${r.reservadoOF}</td>
+            <td style="text-align:right">${r.consumido}</td>
             <td style="text-align:right">${r.faltante}</td>
             <td>${statusBadge(NEED_ESTADO_META[r.estado])}</td>
           </tr>`).join("")}</tbody>
@@ -7032,6 +7089,112 @@ function viewOfDetail(id) {
       </div>
     </div>
   </div>`;
+}
+
+/** Busca un producto por EAN-13 (prioridad) o por SKU — ambos son válidos
+ * para escanear, ya que no todos los productos van a tener EAN-13 cargado
+ * todavía. */
+function findProductByScanCode(code) {
+  const c = (code || "").trim();
+  if (!c) return null;
+  return state.products.find((p) => p.ean13 && p.ean13 === c) || state.products.find((p) => p.sku && p.sku === c) || null;
+}
+
+/** Último resultado de un escaneo por OF (para mostrar un banner bien
+ * visible, no sólo un toast que puede pasar desapercibido durante un
+ * escaneo rápido). Se pisa en cada escaneo nuevo de esa OF. */
+let ofScanMessages = {};
+let ofScanBusy = false;
+
+/** Registra el consumo real de un componente contra una OF: valida que el
+ * código escaneado corresponda a un producto conocido, que ese producto
+ * pertenezca a la LDP de esta OF (si no, bloquea — nunca auto-registra ni
+ * asume un reemplazo), que la cantidad no exceda lo pendiente, y que haya
+ * stock físico real en los lotes (FEFO) para cubrirla. Si cualquier
+ * validación falla, no se escribe nada — "no silent errors". Si todo pasa,
+ * descuenta los lotes, registra el movimiento de stock (mismo mecanismo que
+ * ya usa Inventario), dos registros de trazabilidad (production_consumptions
+ * y production_audit_log) y pasa la OF a EN_PRODUCCION si todavía estaba en
+ * RESERVADA. */
+async function registrarConsumoOF(ofId, codigoEscaneado, cantidad) {
+  const of = getById("manufacturing_orders", ofId);
+  if (!of) throw new Error("OF no encontrada");
+  if (!["RESERVADA", "EN_PRODUCCION"].includes(of.estado)) throw new Error("La OF debe estar Reservada o En producción para registrar consumo");
+  const product = findProductByScanCode(codigoEscaneado);
+  if (!product) throw new Error(`Código no reconocido: "${codigoEscaneado}"`);
+  const row = ofNeedsRows(of).find((r) => r.productId === product.id);
+  if (!row) throw new Error(`"${product.name}" no pertenece a la receta de esta OF. Si es un reemplazo, usá el flujo de reemplazo (próxima fase).`);
+  if (!(cantidad > 0)) throw new Error("Cantidad inválida");
+  if (cantidad > row.pendiente + 0.0001) throw new Error(`Excede lo pendiente de "${product.name}": pendiente ${row.pendiente}, se intentó consumir ${cantidad}`);
+  const { alloc, remaining } = fefoAllocate(product.id, cantidad);
+  if (remaining > 0) throw new Error(`Stock insuficiente en lotes físicos de "${product.name}": faltan ${remaining} de ${cantidad}. No se registró nada.`);
+
+  const usuario = state.session?.user?.email || "Operador";
+  const dispositivo = detectDeviceLabel();
+  const operationUid = uid("opscan");
+
+  if (of.estado === "RESERVADA") {
+    await persist("manufacturing_orders", { ...of, estado: "EN_PRODUCCION", fechaInicio: of.fechaInicio || nowISO() });
+  }
+  for (const a of alloc) {
+    const previousQty = a.lot.quantity;
+    const newQty = previousQty - a.qty;
+    await persist("inventory_lots", { ...a.lot, quantity: newQty });
+    const mov = await registerMovement({
+      productId: product.id, lotId: a.lot.id, type: "consumo_of", quantity: a.qty, previousQty, newQty,
+      reason: `Consumo OF ${of.numero}`, relatedDocument: of.numero,
+    });
+    await persist("production_consumptions", {
+      id: uid("cons"), manufacturingOrderId: of.id, productId: product.id, lotId: a.lot.id, cantidad: a.qty, tipo: "consumo",
+      usuario, dispositivo, operationUid: alloc.length > 1 ? `${operationUid}-${a.lot.id}` : operationUid, stockMovementId: mov.id,
+    });
+  }
+  await persist("production_audit_log", {
+    id: uid("aud"), manufacturingOrderId: of.id, productId: product.id, operacion: "consumo", usuario,
+    infoAnterior: null, infoNueva: { cantidad, codigo: codigoEscaneado, lotes: alloc.map((a) => ({ lotId: a.lot.id, qty: a.qty })) }, notas: "",
+  });
+  return { product, cantidad };
+}
+
+/** Registra avance de producción (cajas realmente terminadas) — soporta
+ * producción parcial: se puede ir marcando de a poco y retomar más tarde.
+ * NO cierra ni completa la OF automáticamente (eso es una fase posterior,
+ * con validación de faltantes) — sólo acumula cantidadProducida. */
+async function registrarAvanceProduccion(ofId, cantidad) {
+  const of = getById("manufacturing_orders", ofId);
+  if (!of) throw new Error("OF no encontrada");
+  if (!(cantidad > 0)) throw new Error("Cantidad inválida");
+  const nuevaProducida = (of.cantidadProducida || 0) + cantidad;
+  if (nuevaProducida > of.cantidadPlanificada + 0.0001) throw new Error(`Excede lo planificado (${of.cantidadPlanificada})`);
+  const usuario = state.session?.user?.email || "Operador";
+  await persist("manufacturing_orders", { ...of, cantidadProducida: nuevaProducida });
+  await persist("production_audit_log", {
+    id: uid("aud"), manufacturingOrderId: of.id, productId: null, operacion: "avance_produccion", usuario,
+    infoAnterior: { cantidadProducida: of.cantidadProducida }, infoNueva: { cantidadProducida: nuevaProducida }, notas: "",
+  });
+  toast(`Avance registrado: ${nuevaProducida}/${of.cantidadPlanificada}`);
+  renderApp();
+}
+
+/** Panel de escaneo/consumo embebido en viewOfDetail — el <input> de texto
+ * es el "escáner universal": cualquier lector USB/Bluetooth o colector
+ * Android que emule teclado escribe el código ahí mismo y termina con
+ * Enter, lo que envía el <form> de forma nativa (ver el listener global de
+ * submit, ya existente, no se toca). La cámara es un agregado opcional
+ * sólo si el navegador la soporta. */
+function viewOfScanPanel(of) {
+  const msg = ofScanMessages[of.id];
+  const camSupported = cameraScanSupported();
+  return `
+    ${msg ? `<div class="hint" style="font-weight:700;color:${msg.type === "err" ? "var(--red, #c0392b)" : "var(--green, #2e7d32)"};margin-bottom:8px">${msg.type === "err" ? "🔴" : "🟢"} ${esc(msg.text)}</div>` : ""}
+    <form data-form="of-consumo" data-id="${of.id}" class="form-grid" style="align-items:end;margin-bottom:14px">
+      <label class="span2">Escanear o escribir código (EAN-13 / SKU)<input class="input" id="of-scan-input" name="codigo" autocomplete="off" autofocus /></label>
+      <label>Cantidad<input class="input" type="number" name="cantidad" min="0.01" step="any" value="1" /></label>
+      <div style="display:flex;gap:8px">
+        <button type="submit" class="btn btn-primary">Registrar consumo</button>
+        ${camSupported ? `<button type="button" class="btn btn-secondary" data-action="of-scan-camera" data-id="${of.id}">📷 Cámara</button>` : ""}
+      </div>
+    </form>`;
 }
 
 /* ---------------------------------------------------------------------------
