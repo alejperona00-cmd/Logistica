@@ -702,6 +702,41 @@ select.input { appearance: none; background-image: linear-gradient(45deg, transp
 .geo-zone-info .hint { margin: 0; }
 .checkbox-row.disabled { opacity: 0.45; cursor: not-allowed; }
 
+/* Cronograma de Pedidos (vista calendario semana/mes) — viewPedidos(). */
+.crono-nav { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; }
+.crono-nav-label { font-weight: 700; font-size: 14px; text-transform: capitalize; }
+.crono-week-scroll { overflow-x: auto; }
+.crono-week-grid { display: grid; grid-template-columns: repeat(7, minmax(160px, 1fr)); gap: 8px; min-width: 900px; }
+.crono-day-col { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); display: flex; flex-direction: column; min-height: 160px; }
+.crono-day-col.crono-day-today { border-color: var(--accent, #C9142B); box-shadow: 0 0 0 1px var(--accent, #C9142B) inset; }
+.crono-day-head { display: flex; justify-content: space-between; align-items: baseline; padding: 8px 10px; border-bottom: 1px solid var(--border-soft); }
+.crono-day-name { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: var(--ink-soft); }
+.crono-day-num { font-size: 15px; font-weight: 700; }
+.crono-day-body { display: flex; flex-direction: column; gap: 6px; padding: 8px; flex: 1; }
+.crono-empty { font-size: 12px; color: var(--ink-faint); padding: 10px 2px; text-align: center; }
+.crono-item { display: flex; flex-direction: column; gap: 3px; background: var(--surface-2); border: 1px solid var(--border-soft); border-radius: 8px; padding: 8px 9px; text-decoration: none; color: var(--ink); transition: transform .15s, box-shadow .15s, border-color .15s; }
+.crono-item:hover { transform: translateY(-1px); border-color: var(--border); box-shadow: var(--shadow-sm); }
+.crono-item.crono-item-done { opacity: 0.6; }
+.crono-item-top { display: flex; justify-content: space-between; align-items: baseline; }
+.crono-item-num { font-size: 11px; font-weight: 700; color: var(--ink-soft); }
+.crono-item-time { font-size: 11px; color: var(--ink-faint); }
+.crono-item-cliente { font-size: 13px; font-weight: 700; }
+.crono-item-line { font-size: 11.5px; color: var(--ink-soft); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.crono-item-bottom { margin-top: 2px; }
+.crono-month-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px; }
+.crono-month-headcell { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: var(--ink-soft); text-align: center; padding: 4px 0; }
+.crono-month-cell { background: var(--surface); border: 1px solid var(--border-soft); border-radius: 8px; min-height: 96px; padding: 6px; display: flex; flex-direction: column; gap: 4px; }
+.crono-month-cell.crono-day-today { border-color: var(--accent, #C9142B); box-shadow: 0 0 0 1px var(--accent, #C9142B) inset; }
+.crono-month-cell.crono-month-cell-out { opacity: 0.4; }
+.crono-month-daynum { font-size: 12px; font-weight: 700; cursor: pointer; align-self: flex-start; }
+.crono-month-daynum:hover { text-decoration: underline; }
+.crono-month-items { display: flex; flex-direction: column; gap: 3px; }
+.crono-mini-item { display: flex; align-items: center; gap: 4px; font-size: 11px; text-decoration: none; color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.crono-mini-item .crono-mini-prod { color: var(--ink-faint); overflow: hidden; text-overflow: ellipsis; }
+.crono-more { font-size: 11px; color: var(--ink-soft); cursor: pointer; }
+.crono-more:hover { text-decoration: underline; }
+@media (max-width: 860px) { .crono-month-cell { min-height: 72px; } }
+
 /* Vista de impresión de OF (Producción) — oculta todo menos .print-of al
    imprimir; sólo se usa desde viewOfImprimir(), no afecta ninguna otra
    pantalla. */

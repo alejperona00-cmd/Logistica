@@ -1771,6 +1771,146 @@ function inDateFilter(dateStr, key) {
    ------------------------------------------------------------------------- */
 let pedidosFilter = { status: "todos", date: "todos", q: "" };
 
+/* ---------------------------------------------------------------------------
+   12.5 CRONOGRAMA DE PEDIDOS (vista calendario: semana / mes)
+   Ubica cada pedido en su "Entrega prevista" (o.expectedDate) — el mismo
+   campo que ya usan los filtros "Esta semana"/"Este mes" de arriba y el
+   dashboard. No lee ni escribe nada nuevo: sólo agrupa state.orders por
+   fecha y reutiliza locations/transports para mostrar destino y
+   transportista. Semana = vista principal (por defecto); Mes = vista
+   secundaria de panorama, con acceso directo a la semana de cualquier día
+   clickeado. */
+let pedidosViewMode = "lista"; // "lista" | "cronograma"
+let cronogramaMode = "semana"; // "semana" | "mes"
+let cronogramaAnchor = todayISO(); // fecha de referencia de la semana/mes visible
+
+function isoFromDate(d) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+function addDaysISO(iso, n) {
+  const d = parseDate(iso);
+  d.setDate(d.getDate() + n);
+  return isoFromDate(d);
+}
+// Domingo-inicio, igual convención que ya usa inDateFilter() para "semana"/"prox_semana".
+function startOfWeekISO(iso) {
+  const d = parseDate(iso);
+  d.setDate(d.getDate() - d.getDay());
+  return isoFromDate(d);
+}
+function startOfMonthISO(iso) {
+  const d = parseDate(iso);
+  return isoFromDate(new Date(d.getFullYear(), d.getMonth(), 1));
+}
+function addMonthsISO(iso, n) {
+  const d = parseDate(iso);
+  return isoFromDate(new Date(d.getFullYear(), d.getMonth() + n, 1));
+}
+const CRONO_DAY_NAMES = ["Dom", "Lun", "Mar", "Mié", "Jue", "Vie", "Sáb"];
+
+/** Agrupa por fecha de entrega prevista, excluyendo cancelados (ya no
+ * representan una entrega planificada real). */
+function ordersByExpectedDate(list) {
+  const map = new Map();
+  for (const o of list) {
+    if (!o.expectedDate || o.status === "cancelado") continue;
+    if (!map.has(o.expectedDate)) map.set(o.expectedDate, []);
+    map.get(o.expectedDate).push(o);
+  }
+  for (const arr of map.values()) arr.sort((a, b) => (a.expectedTime || "").localeCompare(b.expectedTime || ""));
+  return map;
+}
+
+/** Tarjeta completa de un pedido dentro de un día de la semana — cliente,
+ * producto(s), destino y transportista, tal como se pidió. */
+function cronogramaItemHtml(o) {
+  const loc = getById("locations", o.locationId);
+  const transport = getById("transports", o.transportId);
+  const destino = loc ? `${loc.city || loc.name || ""}${loc.province ? ", " + loc.province : ""}` : "—";
+  const productos = (o.items || []).map((it) => it.product).join(", ") || "—";
+  return `<a href="#/pedidos/${o.id}" class="crono-item ${o.status === "entregado" ? "crono-item-done" : ""}">
+    <div class="crono-item-top"><span class="crono-item-num">#${esc(o.number)}</span>${o.expectedTime ? `<span class="crono-item-time">${esc(o.expectedTime)}</span>` : ""}</div>
+    <div class="crono-item-cliente">${esc(o.customerName)}</div>
+    <div class="crono-item-line" title="Producto">📦 ${esc(productos)}</div>
+    <div class="crono-item-line" title="Destino">📍 ${esc(destino)}</div>
+    <div class="crono-item-line" title="Transportista">🚚 ${esc(transport ? transport.name : "—")}</div>
+    <div class="crono-item-bottom">${statusBadge(ORDER_META[o.status])}</div>
+  </a>`;
+}
+
+/** Línea compacta para la vista de mes (panorama): cliente + producto,
+ * con el resto (destino/transportista) disponible en el tooltip y en el
+ * detalle completo de la semana. */
+function cronogramaItemCompactHtml(o) {
+  const productos = (o.items || []).map((it) => it.product).join(", ") || "—";
+  const loc = getById("locations", o.locationId);
+  const transport = getById("transports", o.transportId);
+  const destino = loc ? `${loc.city || loc.name || ""}${loc.province ? ", " + loc.province : ""}` : "—";
+  const tip = `${o.customerName} — ${productos} — ${destino} — ${transport ? transport.name : "Sin transporte"}`;
+  return `<a href="#/pedidos/${o.id}" class="crono-mini-item ${o.status === "entregado" ? "crono-item-done" : ""}" title="${esc(tip)}">
+    <i class="dot-ind ${ORDER_META[o.status]?.cls || "st-gray"}"></i>${esc(o.customerName)} <span class="crono-mini-prod">— ${esc(productos)}</span>
+  </a>`;
+}
+
+/** Vista principal del cronograma: 7 columnas (Dom-Sáb) con el detalle
+ * completo de cada pedido de esa semana. */
+function viewCronogramaSemana() {
+  const start = startOfWeekISO(cronogramaAnchor);
+  const days = Array.from({ length: 7 }, (_, i) => addDaysISO(start, i));
+  const grouped = ordersByExpectedDate(state.orders);
+  const today = todayISO();
+  return `
+    <div class="crono-nav">
+      <button class="btn btn-ghost btn-sm" data-crono-nav="prev-semana">← Semana anterior</button>
+      <div class="crono-nav-label">${fmtDateShort(days[0])} – ${fmtDateShort(days[6])}</div>
+      <button class="btn btn-ghost btn-sm" data-crono-nav="hoy">Hoy</button>
+      <button class="btn btn-ghost btn-sm" data-crono-nav="next-semana">Semana siguiente →</button>
+    </div>
+    <div class="crono-week-scroll"><div class="crono-week-grid">
+      ${days.map((iso, i) => {
+        const list = grouped.get(iso) || [];
+        return `<div class="crono-day-col ${iso === today ? "crono-day-today" : ""}">
+          <div class="crono-day-head"><span class="crono-day-name">${CRONO_DAY_NAMES[i]}</span><span class="crono-day-num">${parseDate(iso).getDate()}</span></div>
+          <div class="crono-day-body">${list.length ? list.map(cronogramaItemHtml).join("") : `<div class="crono-empty">Sin pedidos</div>`}</div>
+        </div>`;
+      }).join("")}
+    </div></div>`;
+}
+
+/** Vista secundaria: panorama del mes completo (6 filas x 7 columnas fijas
+ * para cubrir cualquier mes). Cada día muestra hasta 3 pedidos en formato
+ * compacto; el número de día y el "+N más" llevan directo a la semana de
+ * ese día para ver el detalle completo. */
+function viewCronogramaMes() {
+  const monthStart = startOfMonthISO(cronogramaAnchor);
+  const d0 = parseDate(monthStart);
+  const gridStart = startOfWeekISO(monthStart);
+  const grouped = ordersByExpectedDate(state.orders);
+  const today = todayISO();
+  const cells = Array.from({ length: 42 }, (_, i) => addDaysISO(gridStart, i));
+  const monthLabel = d0.toLocaleDateString("es-AR", { month: "long", year: "numeric" });
+  return `
+    <div class="crono-nav">
+      <button class="btn btn-ghost btn-sm" data-crono-nav="prev-mes">← Mes anterior</button>
+      <div class="crono-nav-label">${esc(monthLabel.charAt(0).toUpperCase() + monthLabel.slice(1))}</div>
+      <button class="btn btn-ghost btn-sm" data-crono-nav="hoy">Hoy</button>
+      <button class="btn btn-ghost btn-sm" data-crono-nav="next-mes">Mes siguiente →</button>
+    </div>
+    <div class="crono-month-grid">
+      ${CRONO_DAY_NAMES.map((n) => `<div class="crono-month-headcell">${n}</div>`).join("")}
+      ${cells.map((iso) => {
+        const inMonth = parseDate(iso).getMonth() === d0.getMonth();
+        const list = grouped.get(iso) || [];
+        const shown = list.slice(0, 3);
+        const extra = list.length - shown.length;
+        return `<div class="crono-month-cell ${inMonth ? "" : "crono-month-cell-out"} ${iso === today ? "crono-day-today" : ""}">
+          <div class="crono-month-daynum" data-crono-day-open="${iso}">${parseDate(iso).getDate()}</div>
+          <div class="crono-month-items">${shown.map(cronogramaItemCompactHtml).join("")}${extra > 0 ? `<div class="crono-more" data-crono-day-open="${iso}">+${extra} más</div>` : ""}</div>
+        </div>`;
+      }).join("")}
+    </div>`;
+}
+
 function orderCard(o) {
   const u = orderUrgency(o);
   return `<a href="#/pedidos/${o.id}" class="order-card">
@@ -1972,6 +2112,24 @@ async function runImportOrders(rows, fileName) {
 }
 
 function viewPedidos() {
+  const viewToggle = `<div class="chip-row">
+    <button class="chip ${pedidosViewMode === "lista" ? "active" : ""}" data-pedidos-view="lista">📋 Lista</button>
+    <button class="chip ${pedidosViewMode === "cronograma" ? "active" : ""}" data-pedidos-view="cronograma">📅 Cronograma</button>
+  </div>`;
+  if (pedidosViewMode === "cronograma") {
+    return `<div class="view-list">
+      <div class="list-toolbar">
+        <h3 class="muted-title">Pedidos — Cronograma</h3>
+        <a href="#/pedidos/nuevo" class="btn btn-primary">+ Nuevo pedido</a>
+      </div>
+      ${viewToggle}
+      <div class="chip-row">
+        <button class="chip chip-ghost ${cronogramaMode === "semana" ? "active" : ""}" data-crono-mode="semana">Semana</button>
+        <button class="chip chip-ghost ${cronogramaMode === "mes" ? "active" : ""}" data-crono-mode="mes">Mes completo</button>
+      </div>
+      ${cronogramaMode === "semana" ? viewCronogramaSemana() : viewCronogramaMes()}
+    </div>`;
+  }
   const statuses = ["todos", ...ORDER_FLOW, "incidencia", "cancelado"];
   let list = state.orders.filter((o) => (pedidosFilter.status === "todos" || o.status === pedidosFilter.status) && inDateFilter(o.expectedDate, pedidosFilter.date));
   if (pedidosFilter.q) {
@@ -1986,6 +2144,7 @@ function viewPedidos() {
       <button type="button" class="btn btn-secondary" data-action="open-modal" data-modal="import-orders">📥 Importar desde Excel</button>
       <a href="#/pedidos/nuevo" class="btn btn-primary">+ Nuevo pedido</a>
     </div>
+    ${viewToggle}
     <div class="chip-row">${statuses.map((s) => `<button class="chip ${pedidosFilter.status === s ? "active" : ""}" data-pedidos-status="${s}">${s === "todos" ? "Todos" : (ORDER_META[s]?.label || s)}</button>`).join("")}</div>
     <div class="chip-row">${DATE_FILTERS.map((f) => `<button class="chip chip-ghost ${pedidosFilter.date === f.key ? "active" : ""}" data-pedidos-date="${f.key}">${f.label}</button>`).join("")}</div>
     ${list.length ? `<div class="card-grid">${list.map(orderCard).join("")}</div>` :
@@ -6290,6 +6449,23 @@ function bindGlobalEvents() {
     if (pedStatus) { pedidosFilter.status = pedStatus.dataset.pedidosStatus; renderApp(); return; }
     const pedDate = e.target.closest("[data-pedidos-date]");
     if (pedDate) { pedidosFilter.date = pedDate.dataset.pedidosDate; renderApp(); return; }
+    const pedView = e.target.closest("[data-pedidos-view]");
+    if (pedView) { pedidosViewMode = pedView.dataset.pedidosView; renderApp(); return; }
+    const cronoMode = e.target.closest("[data-crono-mode]");
+    if (cronoMode) { cronogramaMode = cronoMode.dataset.cronoMode; renderApp(); return; }
+    const cronoNav = e.target.closest("[data-crono-nav]");
+    if (cronoNav) {
+      const action = cronoNav.dataset.cronoNav;
+      if (action === "hoy") cronogramaAnchor = todayISO();
+      else if (action === "prev-semana") cronogramaAnchor = addDaysISO(cronogramaAnchor, -7);
+      else if (action === "next-semana") cronogramaAnchor = addDaysISO(cronogramaAnchor, 7);
+      else if (action === "prev-mes") cronogramaAnchor = addMonthsISO(cronogramaAnchor, -1);
+      else if (action === "next-mes") cronogramaAnchor = addMonthsISO(cronogramaAnchor, 1);
+      renderApp();
+      return;
+    }
+    const cronoDayOpen = e.target.closest("[data-crono-day-open]");
+    if (cronoDayOpen) { cronogramaAnchor = cronoDayOpen.dataset.cronoDayOpen; cronogramaMode = "semana"; renderApp(); return; }
     const comStatus = e.target.closest("[data-compras-status]");
     if (comStatus) { comprasFilter.status = comStatus.dataset.comprasStatus; renderApp(); return; }
     const comDate = e.target.closest("[data-compras-date]");
