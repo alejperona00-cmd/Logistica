@@ -16,6 +16,10 @@ import JsBarcode from "jsbarcode";
 import { fmtMoney, expedicionStageFromStatus, haversineKm, transportRateCost, expedicionPuntuar, expedicionChecklist } from "./domain/expedicion.js";
 import { orderGeoPoint, transportBasePoint, computeOperationalKpis, nodeSummary, distinctValues, zoneCoverageMarkers, incidentGeoPoint } from "./domain/geo.js";
 import { cameraScanSupported, detectDeviceLabel, openCameraScan } from "./domain/barcode.js";
+import {
+  ACQUA_COLUMN_DEFAULTS, ACQUA_EXPORT_COLUMNS, normalizeAcquaRow, parseAcquaImportRows,
+  validateAcquaOfRow, buildAcquaExportRows, exportRowsToAOA, exportRowsToCsv, formatExportBatchId,
+} from "./integrations/acquaFileAdapter.js";
 
 /* ---------------------------------------------------------------------------
    0. UTILIDADES
@@ -175,6 +179,7 @@ const state = {
   dispatch_details: [], transport_rates: [], transport_selections: [], client_notifications: [],
   logistics_zones: [],
   integration_sync_logs: [], integration_errors: [],
+  acqua_export_batches: [], acqua_export_items: [],
   search: "",
   mapFilter: "todos",
   auth: false,
@@ -3144,7 +3149,17 @@ const PRODUCTION_STATUS_META = {
 };
 const PRODUCTION_FLOW = ["planificada", "pendiente", "en_produccion", "finalizada"];
 
-let produccionTab = "hoy"; // "hoy" | "planificar" | "simulador" | "configurar" | "historial"
+let produccionTab = "hoy"; // "hoy" | "planificar" | "simulador" | "configurar" | "historial" | "acqua"
+// --- Integración ACQUA (Fase 1: archivos) --- ver sección 25.5 más abajo.
+let produccionAcquaTab = "importar"; // "importar" | "cerradas" | "historial"
+let acquaImportParsed = null; // { ofRows, errors, fileName } tras elegir el archivo
+let acquaImportRunning = false;
+let acquaImportDecisions = {}; // { [externalOfId]: "actualizar" | "ignorar" }
+let acquaCerradasFilter = { fecha: "", numero: "", producto: "", syncStatus: "" };
+let acquaCerradasSelected = new Set();
+let acquaExportValidation = null; // resultado de validarExportAcqua() antes de generar el archivo
+let acquaExportRunning = false;
+let acquaHistorialDetailId = null;
 // `produccionPlan.lines`: una planificación puede combinar varias líneas de
 // tamaño de caja (ej: 10 L + 5 M) en una sola tanda a confirmar — no se
 // asume una única caja por producción. Tamaños repetidos se consolidan al
@@ -3302,11 +3317,13 @@ function viewProduccion() {
       <button class="chip ${produccionTab === "simulador" ? "active" : ""}" data-prod-tab="simulador">Simulador de producción</button>
       <button class="chip ${produccionTab === "configurar" ? "active" : ""}" data-prod-tab="configurar">Configurar cajas</button>
       <button class="chip ${produccionTab === "historial" ? "active" : ""}" data-prod-tab="historial">Histórico (sistema anterior) (${state.production_orders.length})</button>
+      <button class="chip ${produccionTab === "acqua" ? "active" : ""}" data-prod-tab="acqua">🔗 Integración ACQUA</button>
     </div>
     ${produccionTab === "hoy" ? viewOfHoy()
       : produccionTab === "planificar" ? viewProduccionPlanificar()
       : produccionTab === "simulador" ? viewProduccionSimulador()
       : produccionTab === "configurar" ? viewProduccionConfigurar()
+      : produccionTab === "acqua" ? viewProduccionAcqua()
       : viewProduccionHistorial()}
   </div>`;
 }
@@ -4708,6 +4725,8 @@ function viewGerencia() {
    ------------------------------------------------------------------------- */
 function viewConfig() {
   const email = state.session?.user?.email || "—";
+  const acqCfg = acquaConfig();
+  const kvToText = (obj) => Object.entries(obj || {}).map(([k, v]) => `${k}=${v}`).join("\n");
   return `<div class="view-list">
     <div class="panel">
       <div class="panel-head"><h3>Cuenta</h3></div>
@@ -4723,6 +4742,29 @@ function viewConfig() {
         <button class="btn btn-ghost" data-action="clear-data">Vaciar todos los datos</button>
         <button class="btn btn-ghost" data-action="reset-demo">Cargar datos de ejemplo</button>
       </div>
+    </div>
+    <div class="panel">
+      <div class="panel-head"><h3>Integración ACQUA</h3></div>
+      <p class="desc-text">El formato real de archivo (columnas, layout) todavía no está confirmado con el equipo técnico de ACQUA — ver <code>claude/ACQUA_INTEGRATION_SPEC.md</code>. Todo lo de abajo es editable sin tocar código, y el "ACQUA FILE ADAPTER" (src/integrations/acquaFileAdapter.js) es la única parte de la app que conoce este formato: el día que ACQUA tenga API, se cambia ese archivo y nada más. Podés probar el circuito completo con datos de prueba desde Producción → Integración ACQUA → Importar OF → "Probar con archivo de demostración", sin tocar datos reales.</p>
+      <form data-form="acqua-config" class="form-grid">
+        <label>Formato de importación (archivo que manda ACQUA)
+          <select class="input" name="formatoImportacion">
+            <option value="xlsx" ${acqCfg.formatoImportacion === "xlsx" ? "selected" : ""}>XLSX</option>
+            <option value="csv" ${acqCfg.formatoImportacion === "csv" ? "selected" : ""}>CSV</option>
+          </select>
+        </label>
+        <label>Formato de exportación (archivo de vuelta a ACQUA)
+          <select class="input" name="formatoExportacion">
+            <option value="xlsx" ${acqCfg.formatoExportacion === "xlsx" ? "selected" : ""}>XLSX</option>
+            <option value="csv" ${acqCfg.formatoExportacion === "csv" ? "selected" : ""}>CSV</option>
+          </select>
+        </label>
+        <label>Versión de formato<input class="input" name="versionFormato" value="${esc(acqCfg.versionFormato)}" /></label>
+        <label class="span2">Mapeo de columnas de importación — una por línea, <code>campoInterno=ENCABEZADO_EN_ARCHIVO</code><textarea class="input" name="columnMapping" rows="6" spellcheck="false">${esc(kvToText(acqCfg.columnMapping))}</textarea></label>
+        <label class="span2">Mapeo Producto ACQUA → configuración de caja (LDP) — una por línea, <code>CODIGO_PRODUCTO_ACQUA=idDeConfiguracionDeCaja</code><textarea class="input" name="productoLdpMap" rows="5" spellcheck="false">${esc(kvToText(acqCfg.productoLdpMap))}</textarea></label>
+        <div class="hint span2">Configuraciones de caja disponibles para copiar su id: ${state.box_configs.map((b) => `<code>${esc(b.id)}</code> (${esc(b.size)})`).join(", ") || "todavía no hay ninguna — creá una en Producción → Configurar cajas."}</div>
+        <div class="form-actions span2" style="justify-content:flex-start"><button type="submit" class="btn btn-primary">Guardar configuración ACQUA</button></div>
+      </form>
     </div>
     <div class="panel">
       <div class="panel-head"><h3>Próximamente</h3></div>
@@ -5729,6 +5771,23 @@ async function handleFormSubmit(form) {
     const of = state.manufacturing_orders.find((o) => o.codigoBarras === codigo || o.numero === codigo);
     if (of) location.hash = `#/of_produccion/${of.id}`;
     else toast(`No se encontró ninguna OF con el código "${codigo}"`, "warn");
+  } else if (kind === "acqua-config") {
+    const parseKV = (text) => {
+      const out = {};
+      (text || "").split("\n").map((l) => l.trim()).filter(Boolean).forEach((l) => {
+        const idx = l.indexOf("=");
+        if (idx > 0) out[l.slice(0, idx).trim()] = l.slice(idx + 1).trim();
+      });
+      return out;
+    };
+    await persist("app_settings", { id: "acqua_config", value: {
+      formatoImportacion: val("formatoImportacion") || "xlsx",
+      formatoExportacion: val("formatoExportacion") || "xlsx",
+      versionFormato: val("versionFormato") || "1.0",
+      columnMapping: parseKV(val("columnMapping")),
+      productoLdpMap: parseKV(val("productoLdpMap")),
+    } });
+    toast("Configuración de ACQUA guardada"); renderApp();
   }
 }
 
@@ -6588,6 +6647,65 @@ function bindGlobalEvents() {
 
     const prodTabBtn = e.target.closest("[data-prod-tab]");
     if (prodTabBtn) { produccionTab = prodTabBtn.dataset.prodTab; renderApp(); return; }
+
+    // --- Integración ACQUA (sección 25.5) ---
+    const acquaTabBtn = e.target.closest("[data-acqua-tab]");
+    if (acquaTabBtn) { produccionAcquaTab = acquaTabBtn.dataset.acquaTab; acquaExportValidation = null; renderApp(); return; }
+    const acquaDemoBtn = e.target.closest('[data-action="acqua-demo-import"]');
+    if (acquaDemoBtn) { generarArchivoDemoAcqua(); return; }
+    const acquaSelectAllBtn = e.target.closest('[data-action="acqua-select-all"]');
+    if (acquaSelectAllBtn) { acquaExportableOrders().forEach((o) => acquaCerradasSelected.add(o.id)); acquaExportValidation = null; renderApp(); return; }
+    const acquaSelectNoneBtn = e.target.closest('[data-action="acqua-select-none"]');
+    if (acquaSelectNoneBtn) { acquaCerradasSelected.clear(); acquaExportValidation = null; renderApp(); return; }
+    const acquaExportSelBtn = e.target.closest('[data-action="acqua-export-selected"]');
+    if (acquaExportSelBtn) {
+      const ofsSel = state.manufacturing_orders.filter((o) => acquaCerradasSelected.has(o.id));
+      acquaExportValidation = validarExportAcqua(ofsSel);
+      renderApp(); return;
+    }
+    const acquaGenerarBtn = e.target.closest('[data-action="acqua-generar-archivo"]');
+    if (acquaGenerarBtn) {
+      if (!acquaExportValidation || !acquaExportValidation.ok || acquaExportRunning) return;
+      acquaExportRunning = true;
+      (async () => {
+        try {
+          const result = await generarArchivoAcqua(acquaExportValidation);
+          toast(`Archivo ACQUA generado: ${result.fileName} — ${result.movementCount} movimiento(s) de ${result.ofCount} OF`);
+        } catch (err) {
+          toast(err.message || "No se pudo generar el archivo para ACQUA", "warn");
+        } finally {
+          acquaExportRunning = false;
+          acquaExportValidation = null;
+          acquaCerradasSelected.clear();
+          renderApp();
+        }
+      })();
+      return;
+    }
+    const acquaHistDetail = e.target.closest("[data-acqua-hist-detail]");
+    if (acquaHistDetail) {
+      const hid = acquaHistDetail.dataset.acquaHistDetail;
+      acquaHistorialDetailId = acquaHistorialDetailId === hid ? null : hid;
+      renderMainOnly(); return;
+    }
+    const acquaImportConfirmBtn = e.target.closest("#acqua-import-confirm");
+    if (acquaImportConfirmBtn) {
+      if (!acquaImportParsed || !acquaImportParsed.ofRows.length || acquaImportRunning) return;
+      acquaImportRunning = true;
+      acquaImportConfirmBtn.disabled = true;
+      acquaImportConfirmBtn.textContent = "Importando…";
+      (async () => {
+        const cfgNow = acquaConfig();
+        const { fileName } = acquaImportParsed;
+        const result = await runAcquaImport(acquaImportParsed, cfgNow, fileName);
+        acquaImportRunning = false;
+        acquaImportParsed = null;
+        acquaImportDecisions = {};
+        toast(`Importación ACQUA: ${result.created} nueva(s), ${result.updated} actualizada(s)${result.unchanged ? `, ${result.unchanged} sin cambios` : ""}${result.failed ? `, ${result.failed} con error` : ""}`);
+        renderApp();
+      })();
+      return;
+    }
     const prodConfigSizeBtn = e.target.closest("[data-prod-config-size]");
     if (prodConfigSizeBtn) { produccionConfigSize = prodConfigSizeBtn.dataset.prodConfigSize; renderApp(); return; }
     const delProdConfigItem = e.target.closest('[data-action="prod-config-item-delete"]');
@@ -6948,6 +7066,58 @@ function bindGlobalEvents() {
       relIdSel.innerHTML = options.join("");
       return;
     }
+
+    // --- Integración ACQUA (sección 25.5) ---
+    const acquaCerradaCheck = e.target.closest("[data-acqua-cerrada-check]");
+    if (acquaCerradaCheck) {
+      const cid = acquaCerradaCheck.dataset.acquaCerradaCheck;
+      if (acquaCerradaCheck.checked) acquaCerradasSelected.add(cid); else acquaCerradasSelected.delete(cid);
+      acquaExportValidation = null;
+      renderMainOnly(); return;
+    }
+    const acquaDecisionSel = e.target.closest("[data-acqua-decision]");
+    if (acquaDecisionSel) { acquaImportDecisions[acquaDecisionSel.dataset.acquaDecision] = acquaDecisionSel.value; renderMainOnly(); return; }
+    const acquaFFecha = e.target.closest("#acqua-f-fecha");
+    if (acquaFFecha) { acquaCerradasFilter.fecha = acquaFFecha.value; renderMainOnly(); return; }
+    const acquaFNumero = e.target.closest("#acqua-f-numero");
+    if (acquaFNumero) { acquaCerradasFilter.numero = acquaFNumero.value; renderMainOnly(); return; }
+    const acquaFProducto = e.target.closest("#acqua-f-producto");
+    if (acquaFProducto) { acquaCerradasFilter.producto = acquaFProducto.value; renderMainOnly(); return; }
+    const acquaFSync = e.target.closest("#acqua-f-sync");
+    if (acquaFSync) { acquaCerradasFilter.syncStatus = acquaFSync.value; renderMainOnly(); return; }
+    const acquaImportFile = e.target.closest("#acqua-import-file");
+    if (acquaImportFile) {
+      (async () => {
+        const file = acquaImportFile.files && acquaImportFile.files[0];
+        const preview = $("#acqua-import-preview");
+        const confirmBtn = $("#acqua-import-confirm");
+        if (!file) return;
+        if (confirmBtn) confirmBtn.disabled = true;
+        if (preview) preview.innerHTML = `<p class="hint">Leyendo archivo…</p>`;
+        const cfgFile = acquaConfig();
+        try {
+          let rawRows;
+          if (/\.csv$/i.test(file.name)) {
+            const text = await file.text();
+            const wb = XLSXStyle.read(text, { type: "string" });
+            rawRows = XLSXStyle.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval: "" });
+          } else {
+            const buf = await file.arrayBuffer();
+            const wb = XLSXStyle.read(buf, { type: "array" });
+            rawRows = XLSXStyle.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval: "" });
+          }
+          const { ofRows, errors } = parseAcquaImportRows(rawRows, cfgFile.columnMapping);
+          acquaImportParsed = { ofRows, errors, fileName: file.name };
+          acquaImportDecisions = {};
+          if (preview) preview.innerHTML = acquaImportPreviewHTML(acquaImportParsed, cfgFile);
+          if (confirmBtn) confirmBtn.disabled = ofRows.length === 0;
+        } catch (err) {
+          acquaImportParsed = null;
+          if (preview) preview.innerHTML = `<p class="hint">No se pudo leer el archivo: ${esc(err.message || String(err))}</p>`;
+        }
+      })();
+      return;
+    }
   });
 
   document.addEventListener("submit", (e) => {
@@ -7147,6 +7317,11 @@ async function createManufacturingOrder(opts) {
       customerId: customer?.id || null, customerName: customer?.name || null,
       productoTerminadoId: null, loteTerminadoId: null,
       prioridad: (prioridad && OF_PRIORIDADES[prioridad]) ? prioridad : "NORMAL", estadoPrevio: null,
+      // Procedencia ACQUA (sección 25.5) — null para toda OF creada a mano,
+      // que sigue siendo el caso normal; runAcquaImport() las completa aparte.
+      externalSystem: null, externalOfId: null, sourceFile: null, importedAt: null, importVersion: 1,
+      acquaEstadoOrigen: null, acquaProductoCodigo: null, acquaProductoEan13: null, acquaItemsRaw: null,
+      acquaSyncStatus: null, exportedAt: null, exportBatchId: null,
     };
     try {
       const savedRec = await saveRecord("manufacturing_orders", rec);
@@ -8063,6 +8238,11 @@ async function cerrarOF(ofId) {
   await persist("manufacturing_orders", {
     ...of, estado: "COMPLETADA", fechaCierre: nowISO(),
     productoTerminadoId: boxProduct.id, loteTerminadoId: boxLot.id,
+    // Estado de sincronización con ACQUA — SIEMPRE independiente de `estado`
+    // (sección 25.5): toda OF que se cierra queda pendiente de informar a
+    // ACQUA, sea o no una OF que ACQUA originó, porque ACQUA es el ERP
+    // maestro y necesita conocer el resultado real de cualquier OF.
+    acquaSyncStatus: "PENDIENTE",
   });
   await persist("production_audit_log", {
     id: uid("aud"), manufacturingOrderId: of.id, productId: null, operacion: "cierre", usuario,
@@ -8099,8 +8279,495 @@ function viewOfScanPanel(of) {
 }
 
 /* ---------------------------------------------------------------------------
-   26. INICIO
+   25.5 INTEGRACIÓN ACQUA (Fase 1: intercambio por archivos)
+   ---------------------------------------------------------------------------
+   Modelo conceptual (ver claude/arquitectura-acqua-diagnostico.md y
+   claude/ACQUA_INTEGRATION_SPEC.md): ACQUA es el ERP maestro que define las
+   Órdenes de Fabricación; Logística Perona las ejecuta operativamente sobre
+   la MISMA manufacturing_order de la sección 25 (nunca una copia ni un
+   estado paralelo) y devuelve los resultados reales. Todo lo específico del
+   formato de archivo de ACQUA (columnas, layout, nombres de campo) vive
+   exclusivamente en src/integrations/acquaFileAdapter.js — el "ACQUA FILE
+   ADAPTER" — para poder cambiarlo, o reemplazarlo por un "ACQUA API
+   ADAPTER" en Fase 2, sin tocar una sola línea de esta sección ni de la
+   lógica de Producción/OF (sección 25). Nada de lo de abajo asume ni
+   inventa el formato real: todo pasa por config (acquaConfig(), persistida
+   en app_settings) o por el adaptador, ambos editables sin tocar código.
    ------------------------------------------------------------------------- */
+
+const ACQUA_IMPORT_SOURCE = "acqua_file_import";
+const ACQUA_EXPORT_SOURCE = "acqua_file_export";
+const ACQUA_SYNC_META = {
+  PENDIENTE: { label: "Pendiente de exportar", cls: "st-gray" },
+  PREPARADA: { label: "Preparada", cls: "st-blue" },
+  EXPORTADA: { label: "Exportada", cls: "st-orange" },
+  PROCESADA: { label: "Procesada por ACQUA", cls: "st-green" },
+  ERROR: { label: "Error", cls: "st-red" },
+  REQUIERE_REVISION: { label: "Requiere revisión", cls: "st-red" },
+};
+const ACQUA_CONFIG_DEFAULTS = {
+  formatoImportacion: "xlsx", // xlsx | csv — archivo que manda ACQUA (provisorio)
+  formatoExportacion: "xlsx", // xlsx | csv — archivo de vuelta a ACQUA (provisorio)
+  versionFormato: "1.0",
+  columnMapping: { ...ACQUA_COLUMN_DEFAULTS },
+  productoLdpMap: {}, // { [codigoProductoACQUA]: boxConfigId } — exigido, nunca inferido
+};
+
+/** Config de la integración ACQUA, persistida en app_settings (mismo
+ * mecanismo genérico que ya usan alert_thresholds/production_settings/
+ * gerencia_objetivos/expedicion_config) — no crea una tabla nueva sólo para
+ * esto. Editable desde Configuración → Integración ACQUA sin tocar código. */
+function acquaConfig() {
+  const row = getById("app_settings", "acqua_config");
+  const v = row?.value || {};
+  return {
+    formatoImportacion: v.formatoImportacion || ACQUA_CONFIG_DEFAULTS.formatoImportacion,
+    formatoExportacion: v.formatoExportacion || ACQUA_CONFIG_DEFAULTS.formatoExportacion,
+    versionFormato: v.versionFormato || ACQUA_CONFIG_DEFAULTS.versionFormato,
+    columnMapping: { ...ACQUA_COLUMN_DEFAULTS, ...(v.columnMapping || {}) },
+    productoLdpMap: v.productoLdpMap || {},
+  };
+}
+
+function viewProduccionAcqua() {
+  return `<div>
+    <div class="hint" style="margin-bottom:12px">Integración con ACQUA (Fase 1 — por archivos). El formato exacto todavía depende de la especificación técnica de ACQUA: ver <code>claude/ACQUA_INTEGRATION_SPEC.md</code> en el proyecto. Podés configurar formato y mapeos en Configuración → Integración ACQUA.</div>
+    <div class="chip-row" style="margin-bottom:16px">
+      <button class="chip ${produccionAcquaTab === "importar" ? "active" : ""}" data-acqua-tab="importar">📥 Importar OF</button>
+      <button class="chip ${produccionAcquaTab === "cerradas" ? "active" : ""}" data-acqua-tab="cerradas">📦 OF cerradas para ACQUA</button>
+      <button class="chip ${produccionAcquaTab === "historial" ? "active" : ""}" data-acqua-tab="historial">🕘 Historial de intercambios</button>
+    </div>
+    ${produccionAcquaTab === "importar" ? viewAcquaImportar()
+      : produccionAcquaTab === "cerradas" ? viewAcquaCerradas()
+      : viewAcquaHistorial()}
+  </div>`;
+}
+
+/* --- 25.5.1 IMPORTAR OF DESDE ACQUA -------------------------------------- */
+
+/** Una OF ya importada antes de ACQUA (mismo external_system+external_of_id,
+ * índice único en schema.sql) — para decidir qué hacer, nunca para pisarla
+ * en silencio. */
+function acquaMatchExisting(externalOfId) {
+  return state.manufacturing_orders.find((o) => o.externalSystem === "ACQUA" && o.externalOfId === externalOfId);
+}
+
+function acquaPrioridadDesde(p) {
+  if (!p) return null;
+  const s = stripAccentsLower(String(p));
+  if (s.includes("urgen")) return "URGENTE";
+  if (s.includes("alta")) return "ALTA";
+  if (s.includes("media")) return "MEDIA";
+  if (s.includes("baja")) return "BAJA";
+  if (s.includes("normal")) return "NORMAL";
+  return null;
+}
+
+function acquaImportPreviewHTML(parsed, cfg) {
+  const { ofRows, errors, fileName } = parsed;
+  let nuevas = 0, existentes = 0, bloqueadas = 0, conError = 0;
+  const rowsHtml = ofRows.map((row) => {
+    const rowErrors = validateAcquaOfRow(row, cfg);
+    const existing = acquaMatchExisting(row.externalOfId);
+    let situacion, detalle;
+    if (rowErrors.length) {
+      conError++;
+      situacion = `<span class="badge st-red">Error</span>`;
+      detalle = esc(rowErrors.join("; "));
+    } else if (existing) {
+      existentes++;
+      const puedeActualizar = ["BORRADOR", "PLANIFICADA"].includes(existing.estado);
+      if (!puedeActualizar) {
+        bloqueadas++;
+        situacion = `<span class="badge st-orange">Ya existe (${esc(existing.numero)})</span>`;
+        detalle = `En curso (${esc(existing.estado)}) — no se puede actualizar por import, se ignora.`;
+        acquaImportDecisions[row.externalOfId] = "ignorar";
+      } else {
+        situacion = `<span class="badge st-blue">Ya existe (${esc(existing.numero)})</span>`;
+        const dec = acquaImportDecisions[row.externalOfId] || "actualizar";
+        detalle = `<select class="input input-sm" data-acqua-decision="${esc(row.externalOfId)}">
+          <option value="actualizar" ${dec === "actualizar" ? "selected" : ""}>Actualizar OF existente</option>
+          <option value="ignorar" ${dec === "ignorar" ? "selected" : ""}>Ignorar (no tocar)</option>
+        </select>`;
+      }
+    } else {
+      nuevas++;
+      situacion = `<span class="badge st-green">Nueva</span>`;
+    }
+    return `<tr>
+      <td>${esc(row.externalOfId)}</td><td>${esc(row.numero || "—")}</td><td>${esc(row.productoCodigo || row.productoNombre || "—")}</td>
+      <td>${esc(String(row.cantidadPlanificada ?? "—"))}</td><td>${situacion}</td><td>${detalle}</td>
+    </tr>`;
+  }).join("");
+  return `
+    <div class="stat-row wrap">
+      <div class="stat-box"><b>${ofRows.length + errors.length}</b><span>OF encontradas</span></div>
+      <div class="stat-box"><b>${nuevas}</b><span>Nuevas</span></div>
+      <div class="stat-box"><b>${existentes}</b><span>Existentes</span></div>
+      <div class="stat-box"><b>${conError + errors.length}</b><span>Con error</span></div>
+    </div>
+    ${bloqueadas ? `<div class="hint" style="margin-top:8px;color:var(--danger)">${bloqueadas} OF ya está en curso en Logística Perona (reservada/en producción) — no se puede actualizar por import, queda ignorada.</div>` : ""}
+    ${errors.length ? `<div class="hint" style="margin-top:8px;color:var(--danger)">${errors.length} fila(s) del archivo no forman una OF válida: ${errors.slice(0, 5).map((e) => `fila ${e.fila} (${esc(e.message)})`).join("; ")}${errors.length > 5 ? "…" : ""}</div>` : ""}
+    <table class="table" style="margin-top:10px"><thead><tr><th>ID ACQUA</th><th>Número</th><th>Producto</th><th>Cantidad</th><th>Situación</th><th>Detalle / decisión</th></tr></thead><tbody>${rowsHtml || `<tr><td colspan="6" class="muted">Sin OF válidas en el archivo.</td></tr>`}</tbody></table>
+    <div class="hint" style="margin-top:8px">Archivo: ${esc(fileName)}</div>
+  `;
+}
+
+function viewAcquaImportar() {
+  const cfg = acquaConfig();
+  return `<div class="panel">
+    <div class="panel-head"><h3>Importar OF desde ACQUA</h3></div>
+    <div class="hint" style="margin-bottom:10px">Subí el archivo que exporta ACQUA con las Órdenes de Fabricación (formato configurado: <b>${esc(cfg.formatoImportacion.toUpperCase())}</b> — cambiable en Configuración). Cada producto de ACQUA necesita una configuración de caja (LDP) mapeada en Configuración → Integración ACQUA antes de poder importarse: nunca se adivina esa relación. Una OF ya importada antes no se pisa sola — se te pregunta qué hacer.</div>
+    <input type="file" id="acqua-import-file" accept=".xlsx,.xls,.csv" class="input" />
+    <div id="acqua-import-preview" style="margin-top:12px">${acquaImportParsed ? acquaImportPreviewHTML(acquaImportParsed, cfg) : ""}</div>
+    <div class="form-actions">
+      <button type="button" class="btn btn-primary" id="acqua-import-confirm" ${(!acquaImportParsed || !acquaImportParsed.ofRows.length) ? "disabled" : ""}>Confirmar importación</button>
+      <button type="button" class="btn btn-ghost" data-action="acqua-demo-import">🧪 Probar con archivo de demostración</button>
+    </div>
+  </div>`;
+}
+
+/** Ejecuta la importación ya confirmada: crea OF nuevas (createManufacturingOrder,
+ * sección 25, exactamente la misma que usa el resto de la app) o actualiza
+ * las existentes según la decisión tomada por fila — nunca pisa una OF que
+ * ya está en curso. Deja registro en integration_sync_logs/integration_errors,
+ * igual que ya hace runImportOrders() para pedidos. */
+async function runAcquaImport(parsed, cfg, fileName) {
+  const startedAt = nowISO();
+  const usuario = state.session?.user?.email || "Operador";
+  let created = 0, updated = 0, unchanged = 0, failed = 0;
+  const errorRows = [];
+  for (const row of parsed.ofRows) {
+    try {
+      const rowErrors = validateAcquaOfRow(row, cfg);
+      if (rowErrors.length) throw new Error(rowErrors.join("; "));
+      const boxConfigId = cfg.productoLdpMap[row.productoCodigo];
+      const existing = acquaMatchExisting(row.externalOfId);
+      if (existing) {
+        const decision = acquaImportDecisions[row.externalOfId] || "actualizar";
+        if (decision === "ignorar" || !["BORRADOR", "PLANIFICADA"].includes(existing.estado)) { unchanged++; continue; }
+        await persist("manufacturing_orders", {
+          ...existing,
+          cantidadPlanificada: parseFloat(row.cantidadPlanificada) || existing.cantidadPlanificada,
+          fechaPlanificacion: row.fechaPlanificacion || existing.fechaPlanificacion,
+          prioridad: acquaPrioridadDesde(row.prioridad) || existing.prioridad,
+          acquaEstadoOrigen: row.estadoOrigen || null, acquaProductoCodigo: row.productoCodigo || null,
+          acquaProductoEan13: row.ean13 || null, acquaItemsRaw: row.itemsRaw && row.itemsRaw.length ? row.itemsRaw : null,
+          sourceFile: fileName, importedAt: nowISO(), importVersion: (existing.importVersion || 1) + 1,
+        });
+        updated++;
+      } else {
+        const of = await createManufacturingOrder({
+          boxConfigId, cantidadPlanificada: parseFloat(row.cantidadPlanificada) || 0,
+          fechaPlanificacion: row.fechaPlanificacion || null, prioridad: acquaPrioridadDesde(row.prioridad),
+          notes: `Importada de ACQUA (ID ${row.externalOfId}${row.numero ? ", " + row.numero : ""}).`,
+        });
+        await persist("manufacturing_orders", {
+          ...of, externalSystem: "ACQUA", externalOfId: row.externalOfId, sourceFile: fileName,
+          importedAt: nowISO(), importVersion: 1, acquaEstadoOrigen: row.estadoOrigen || null,
+          acquaProductoCodigo: row.productoCodigo || null, acquaProductoEan13: row.ean13 || null,
+          acquaItemsRaw: row.itemsRaw && row.itemsRaw.length ? row.itemsRaw : null,
+        });
+        created++;
+      }
+    } catch (err) {
+      failed++;
+      errorRows.push({ id: uid("ierr"), syncLogId: null, source: ACQUA_IMPORT_SOURCE, entity: "manufacturing_order", externalId: row.externalOfId || null, field: null, message: String(err?.message || err), attempts: 1, status: "error" });
+    }
+  }
+  for (const e of parsed.errors) {
+    failed++;
+    errorRows.push({ id: uid("ierr"), syncLogId: null, source: ACQUA_IMPORT_SOURCE, entity: "manufacturing_order", externalId: null, field: `fila ${e.fila}`, message: e.message, attempts: 1, status: "error" });
+  }
+  const log = {
+    id: uid("isl"), source: ACQUA_IMPORT_SOURCE, startedAt, finishedAt: nowISO(), status: failed ? "completed_with_errors" : "completed",
+    recordsReceived: parsed.ofRows.length + parsed.errors.length, recordsCreated: created, recordsUpdated: updated, recordsUnchanged: unchanged, recordsFailed: failed,
+    notes: `Archivo: ${fileName} · usuario ${usuario}`,
+  };
+  await persist("integration_sync_logs", log);
+  for (const er of errorRows) { er.syncLogId = log.id; await persist("integration_errors", er); }
+  return { created, updated, unchanged, failed };
+}
+
+/** Genera un archivo de EJEMPLO (una OF de prueba, con el mapeo de columnas
+ * configurado) para probar todo el circuito ACQUA → archivo → Logística
+ * Perona → ejecución → cierre → archivo de vuelta sin tocar ningún dato
+ * real de ACQUA (sección 17 del pedido: modo demo/simulación). */
+function generarArchivoDemoAcqua() {
+  const cfg = acquaConfig();
+  const map = { ...ACQUA_COLUMN_DEFAULTS, ...cfg.columnMapping };
+  const codigoDemo = Object.keys(cfg.productoLdpMap)[0] || "CAJA-DEMO";
+  const idOfDemo = `DEMO-${Date.now()}`;
+  const row = {
+    [map.externalOfId]: idOfDemo, [map.numero]: "ACQ-DEMO-1", [map.fecha]: todayISO(),
+    [map.productoCodigo]: codigoDemo, [map.productoNombre]: "Producto de demostración ACQUA",
+    [map.cantidadPlanificada]: "10", [map.estadoOrigen]: "LIBERADA", [map.prioridad]: "NORMAL",
+  };
+  const headers = Object.keys(row);
+  const aoa = [headers, headers.map((h) => row[h])];
+  const wb = XLSXStyle.utils.book_new();
+  const ws = XLSXStyle.utils.aoa_to_sheet(aoa);
+  XLSXStyle.utils.book_append_sheet(wb, ws, "DEMO_ACQUA");
+  const fileName = `acqua-demo-import-${todayISO()}.xlsx`;
+  XLSXStyle.writeFile(wb, fileName);
+  if (!Object.keys(cfg.productoLdpMap).length) {
+    toast(`Archivo de demostración generado (${fileName}). Todavía no configuraste ningún mapeo Producto ACQUA → LDP en Configuración, así que al importarlo de prueba va a quedar marcado con error hasta que mapees al menos un código — es intencional, para no inventar esa relación.`, "warn");
+  } else {
+    toast(`Archivo de demostración generado (${fileName}) — subilo en "Importar OF" para probar el circuito completo sin tocar datos reales de ACQUA.`);
+  }
+}
+
+/* --- 25.5.2 OF CERRADAS PARA ACQUA (selección + exportación) ------------ */
+
+/** OF exportables: toda OF COMPLETADA (cerrada), sea o no originada en
+ * ACQUA — ver decisión de diseño en cerrarOF() (sección 25): ACQUA es el
+ * ERP maestro y necesita conocer el resultado real de cualquier OF. */
+function acquaExportableOrders() {
+  return state.manufacturing_orders.filter((o) => o.estado === "COMPLETADA");
+}
+
+/** Movimientos reales de UNA OF todavía no exportados a ACQUA — consumos,
+ * sustituciones y el propio cierre —, excluyendo los que YA están en
+ * acqua_export_items (por source_table+source_record_id: el mismo criterio
+ * que hace estructuralmente imposible la duplicación en la base, ver
+ * schema.sql). No se resuelve a partir del archivo: siempre desde los
+ * registros reales (production_consumptions/production_substitutions/
+ * manufacturing_orders), que son la única fuente de verdad. */
+function acquaPendingMovementsForOf(of) {
+  const yaExportado = new Set(state.acqua_export_items.map((i) => `${i.sourceTable}:${i.sourceRecordId}`));
+  const movimientos = [];
+  state.production_consumptions
+    .filter((c) => c.manufacturingOrderId === of.id && c.tipo === "consumo")
+    .forEach((c) => {
+      if (yaExportado.has(`production_consumptions:${c.id}`)) return;
+      const prod = getById("products", c.productId);
+      movimientos.push({
+        tipo: "consumo", sourceTable: "production_consumptions", sourceRecordId: c.id,
+        productId: c.productId, productoCodigo: prod?.sku || "", productoNombre: prod?.name || "",
+        ean13: prod?.ean13 || "", cantidadReal: c.cantidad,
+        fecha: c.createdAt || of.fechaCierre || nowISO(), usuario: c.usuario || "",
+        idMovimiento: c.operationUid || `${of.numero}-CONS-${c.id}`,
+      });
+    });
+  state.production_substitutions
+    .filter((s) => s.manufacturingOrderId === of.id)
+    .forEach((s) => {
+      if (yaExportado.has(`production_substitutions:${s.id}`)) return;
+      const orig = getById("products", s.productoOriginalId);
+      const sust = getById("products", s.productoSustitutoId);
+      movimientos.push({
+        tipo: "sustitucion", sourceTable: "production_substitutions", sourceRecordId: s.id,
+        productId: s.productoSustitutoId, productoOriginalId: s.productoOriginalId, productoSustitutoId: s.productoSustitutoId,
+        productoCodigo: sust?.sku || "", productoNombre: sust?.name || "", ean13: sust?.ean13 || "",
+        productoOriginalCodigo: orig?.sku || "", productoSustitutoCodigo: sust?.sku || "", cantidadSustituida: s.cantidad,
+        fecha: s.createdAt || of.fechaCierre || nowISO(), usuario: s.usuario || "",
+        idMovimiento: `${of.numero}-SUB-${s.id}`,
+      });
+    });
+  if (!yaExportado.has(`manufacturing_orders:${of.id}`)) {
+    const prodTerm = getById("products", of.productoTerminadoId);
+    movimientos.push({
+      tipo: "cierre", sourceTable: "manufacturing_orders", sourceRecordId: of.id,
+      productId: of.productoTerminadoId, productoCodigo: prodTerm?.sku || "", productoNombre: prodTerm?.name || "",
+      ean13: prodTerm?.ean13 || "", cantidadPlanificada: of.cantidadPlanificada, cantidadReal: of.cantidadProducida,
+      fecha: of.fechaCierre || nowISO(), usuario: of.usuarioResponsable || "", idMovimiento: `${of.numero}-CIERRE`,
+    });
+  }
+  return movimientos;
+}
+
+/** Checklist de validación previa (sección 12 del pedido) — si hay algún
+ * error, NO se genera el archivo; se muestra exactamente qué OF/producto/
+ * movimiento tiene el problema. */
+function validarExportAcqua(ofs) {
+  const checklist = [];
+  const problemas = [];
+  let ok = true;
+  const check = (label, cond, detalles) => {
+    checklist.push({ label, ok: !!cond });
+    if (!cond) { ok = false; if (detalles && detalles.length) problemas.push(...detalles); }
+  };
+
+  check("Se seleccionó al menos una OF", ofs.length > 0, ofs.length ? null : ["No se seleccionó ninguna OF cerrada."]);
+  check("Todas las OF seleccionadas tienen identificador (número)", ofs.every((o) => !!o.numero));
+  const sinProducto = ofs.filter((o) => !o.productoTerminadoId).map((o) => `OF ${o.numero}: sin producto terminado registrado`);
+  check("Todas las OF tienen producto terminado", sinProducto.length === 0, sinProducto);
+  const sinCantidad = ofs.filter((o) => !(o.cantidadProducida > 0)).map((o) => `OF ${o.numero}: cantidad producida en 0`);
+  check("Todas las OF tienen cantidades registradas", sinCantidad.length === 0, sinCantidad);
+  const sinCodigo = [];
+  ofs.forEach((o) => {
+    const p = getById("products", o.productoTerminadoId);
+    if (p && !p.sku) sinCodigo.push(`OF ${o.numero}: producto "${p.name}" sin código`);
+  });
+  check("Todos los productos involucrados tienen código", sinCodigo.length === 0, sinCodigo);
+
+  const movimientos = [];
+  ofs.forEach((o) => acquaPendingMovementsForOf(o).forEach((m) => movimientos.push({ ...m, ofNumero: o.numero })));
+  check("Todos los movimientos tienen identificador único", movimientos.every((m) => !!m.idMovimiento));
+  const seen = new Set(); const dup = [];
+  movimientos.forEach((m) => { if (seen.has(m.idMovimiento)) dup.push(`ID de movimiento repetido: ${m.idMovimiento} (OF ${m.ofNumero})`); seen.add(m.idMovimiento); });
+  check("No hay movimientos duplicados en esta selección", dup.length === 0, dup);
+  check("No existen movimientos ya exportados antes en esta selección (anti-duplicación)", true); // acquaPendingMovementsForOf ya los excluye — se deja explícito en el checklist.
+  check("Hay al menos un movimiento nuevo para exportar", movimientos.length > 0, ofs.length && movimientos.length === 0 ? ["Las OF seleccionadas no tienen ningún movimiento nuevo — puede que ya se hayan exportado todas antes."] : null);
+
+  return { ok, checklist, problemas, movimientos, ofs };
+}
+
+function acquaValidationHTML(v) {
+  return `<div class="panel" style="margin-top:12px;border-color:${v.ok ? "var(--green, #2e7d32)" : "var(--danger)"}">
+    <div class="panel-head"><h3>${v.ok ? "✅ Validación previa: todo en orden" : "🔴 Validación previa: hay errores"}</h3></div>
+    <ul style="margin:0 0 8px 18px">${v.checklist.map((c) => `<li>${c.ok ? "✓" : "✗"} ${esc(c.label)}</li>`).join("")}</ul>
+    ${v.problemas.length ? `<div class="hint" style="color:var(--danger)">${v.problemas.map(esc).join("<br/>")}</div>` : ""}
+    ${v.ok
+      ? `<div class="form-actions" style="justify-content:flex-start"><button type="button" class="btn btn-primary" data-action="acqua-generar-archivo">Generar archivo (${v.movimientos.length} movimiento(s), ${v.ofs.length} OF)</button></div>`
+      : `<div class="hint">Corregí lo anterior — mientras haya errores no se genera ningún archivo.</div>`}
+  </div>`;
+}
+
+function viewAcquaCerradas() {
+  const f = acquaCerradasFilter;
+  let rows = acquaExportableOrders();
+  if (f.fecha) rows = rows.filter((o) => (o.fechaCierre || "").slice(0, 10) === f.fecha);
+  if (f.numero) rows = rows.filter((o) => stripAccentsLower(o.numero || "").includes(stripAccentsLower(f.numero)));
+  if (f.producto) rows = rows.filter((o) => stripAccentsLower(getById("products", o.productoTerminadoId)?.name || "").includes(stripAccentsLower(f.producto)));
+  if (f.syncStatus) rows = rows.filter((o) => (o.acquaSyncStatus || "PENDIENTE") === f.syncStatus);
+  rows = rows.slice().sort((a, b) => (b.fechaCierre || "").localeCompare(a.fechaCierre || ""));
+
+  const rowsHtml = rows.map((o) => {
+    const prod = getById("products", o.productoTerminadoId);
+    const sync = ACQUA_SYNC_META[o.acquaSyncStatus || "PENDIENTE"] || ACQUA_SYNC_META.PENDIENTE;
+    const checked = acquaCerradasSelected.has(o.id) ? "checked" : "";
+    return `<tr>
+      <td><input type="checkbox" data-acqua-cerrada-check="${o.id}" ${checked} /></td>
+      <td>${esc(o.numero)}</td><td>${o.fechaCierre ? esc(o.fechaCierre.slice(0, 10)) : "—"}</td>
+      <td>${esc(prod?.name || "—")}</td><td>${esc(String(o.cantidadProducida ?? "—"))}</td>
+      <td><span class="badge ${sync.cls}">${esc(sync.label)}</span></td>
+      <td>${o.externalOfId ? "ACQUA · " + esc(o.externalOfId) : "Creada en Logística Perona"}</td>
+    </tr>`;
+  }).join("");
+
+  return `<div class="panel">
+    <div class="panel-head"><h3>OF cerradas para ACQUA</h3></div>
+    <div class="form-grid" style="margin-bottom:10px">
+      <label>Fecha de cierre<input class="input" type="date" id="acqua-f-fecha" value="${esc(f.fecha)}" /></label>
+      <label>Número de OF<input class="input" id="acqua-f-numero" value="${esc(f.numero)}" /></label>
+      <label>Producto<input class="input" id="acqua-f-producto" value="${esc(f.producto)}" /></label>
+      <label>Estado de sincronización
+        <select class="input" id="acqua-f-sync">
+          <option value="">Todos</option>
+          ${Object.entries(ACQUA_SYNC_META).map(([k, m]) => `<option value="${k}" ${f.syncStatus === k ? "selected" : ""}>${esc(m.label)}</option>`).join("")}
+        </select>
+      </label>
+    </div>
+    <div class="form-actions" style="justify-content:flex-start">
+      <button type="button" class="btn btn-ghost btn-sm" data-action="acqua-select-all">Seleccionar todas (${rows.length})</button>
+      <button type="button" class="btn btn-ghost btn-sm" data-action="acqua-select-none">Ninguna</button>
+      <button type="button" class="btn btn-primary" data-action="acqua-export-selected" ${acquaCerradasSelected.size ? "" : "disabled"}>Exportar seleccionadas (${acquaCerradasSelected.size})</button>
+    </div>
+    ${acquaExportValidation ? acquaValidationHTML(acquaExportValidation) : ""}
+    <table class="table" style="margin-top:10px"><thead><tr><th></th><th>OF</th><th>Cierre</th><th>Producto</th><th>Cant.</th><th>Sync ACQUA</th><th>Origen</th></tr></thead>
+    <tbody>${rowsHtml || `<tr><td colspan="7" class="muted">No hay OF cerradas con estos filtros.</td></tr>`}</tbody></table>
+  </div>`;
+}
+
+/** Genera el archivo de retorno a ACQUA para la selección ya validada
+ * (validarExportAcqua, sin errores): agrupa movimientos por OF, los pasa por
+ * el ACQUA FILE ADAPTER (buildAcquaExportRows/exportRowsToAOA/exportRowsToCsv
+ * — nunca conoce el formato acá), descarga el archivo, y deja constancia
+ * permanente en acqua_export_batches + acqua_export_items (ésta es la
+ * anti-duplicación real, a nivel de fila con índice único — ver schema.sql)
+ * antes de marcar cada OF como EXPORTADA. */
+async function generarArchivoAcqua(validation) {
+  const cfg = acquaConfig();
+  const usuario = state.session?.user?.email || "Operador";
+  const now = new Date();
+  const todayKey = `ACQUA-${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, "0")}${String(now.getDate()).padStart(2, "0")}`;
+  const seqToday = state.acqua_export_batches.filter((b) => (b.exportBatchId || "").startsWith(todayKey)).length + 1;
+  const exportBatchId = formatExportBatchId(now, seqToday);
+
+  const movsByOf = new Map();
+  validation.movimientos.forEach((m) => {
+    if (!movsByOf.has(m.ofNumero)) movsByOf.set(m.ofNumero, []);
+    movsByOf.get(m.ofNumero).push(m);
+  });
+  let exportRows = [];
+  for (const of of validation.ofs) {
+    const movs = movsByOf.get(of.numero) || [];
+    if (!movs.length) continue;
+    const prodTerm = getById("products", of.productoTerminadoId);
+    const ofForExport = { numero: of.numero, externalOfId: of.externalOfId || "", productoTerminadoCodigo: prodTerm?.sku || "", productoTerminadoNombre: prodTerm?.name || "", estado: of.estado };
+    exportRows = exportRows.concat(buildAcquaExportRows(ofForExport, movs));
+  }
+
+  const fileName = `acqua-export-${exportBatchId}.${cfg.formatoExportacion}`;
+  if (cfg.formatoExportacion === "csv") {
+    const csv = exportRowsToCsv(exportRows);
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+    const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = fileName;
+    document.body.appendChild(a); a.click(); a.remove();
+  } else {
+    const aoa = exportRowsToAOA(exportRows);
+    const wb = XLSXStyle.utils.book_new();
+    const ws = XLSXStyle.utils.aoa_to_sheet(aoa);
+    ACQUA_EXPORT_COLUMNS.forEach((c, i) => {
+      const ref = XLSXStyle.utils.encode_cell({ r: 0, c: i });
+      if (ws[ref]) ws[ref].s = xlsxCellStyle({ bg: "111111", font: "FFFFFF", bold: true });
+    });
+    XLSXStyle.utils.book_append_sheet(wb, ws, "ACQUA");
+    XLSXStyle.writeFile(wb, fileName);
+  }
+
+  const batchId = uid("aexb");
+  await persist("acqua_export_batches", {
+    id: batchId, exportBatchId, generatedAt: nowISO(), generatedBy: usuario, fileName,
+    format: cfg.formatoExportacion, ofCount: validation.ofs.length, movementCount: exportRows.length, status: "GENERADO", notes: "",
+  });
+  for (const m of validation.movimientos) {
+    const ofRec = state.manufacturing_orders.find((o) => o.numero === m.ofNumero);
+    await persist("acqua_export_items", {
+      id: uid("aexi"), exportBatchId: batchId, manufacturingOrderId: ofRec?.id || null,
+      movementType: m.tipo, sourceTable: m.sourceTable, sourceRecordId: m.sourceRecordId,
+      productId: m.productId || null, ean13: m.ean13 || null,
+      cantidadPlanificada: m.cantidadPlanificada ?? null, cantidadReal: m.cantidadReal ?? null,
+      productoOriginalId: m.productoOriginalId || null, productoSustitutoId: m.productoSustitutoId || null,
+      cantidadSustituida: m.cantidadSustituida ?? null, uniqueMovementId: m.idMovimiento, fecha: m.fecha || nowISO(),
+    });
+  }
+  for (const of of validation.ofs) {
+    await persist("manufacturing_orders", { ...of, acquaSyncStatus: "EXPORTADA", exportedAt: nowISO(), exportBatchId });
+  }
+  await persist("integration_sync_logs", {
+    id: uid("isl"), source: ACQUA_EXPORT_SOURCE, startedAt: nowISO(), finishedAt: nowISO(), status: "completed",
+    recordsReceived: validation.ofs.length, recordsCreated: exportRows.length, recordsUpdated: 0, recordsUnchanged: 0, recordsFailed: 0,
+    notes: `Lote ${exportBatchId} · archivo ${fileName} · usuario ${usuario}`,
+  });
+  return { exportBatchId, fileName, ofCount: validation.ofs.length, movementCount: exportRows.length };
+}
+
+/* --- 25.5.3 HISTORIAL DE INTERCAMBIOS ------------------------------------ */
+
+function viewAcquaHistorial() {
+  const logs = state.integration_sync_logs
+    .filter((l) => l.source === ACQUA_IMPORT_SOURCE || l.source === ACQUA_EXPORT_SOURCE)
+    .slice().sort((a, b) => (b.startedAt || "").localeCompare(a.startedAt || ""));
+  const rowsHtml = logs.map((l) => {
+    const errs = state.integration_errors.filter((e) => e.syncLogId === l.id);
+    const tipo = l.source === ACQUA_IMPORT_SOURCE ? "📥 Importación" : "📤 Exportación";
+    const abierto = acquaHistorialDetailId === l.id;
+    return `<tr class="row-click" data-acqua-hist-detail="${l.id}">
+      <td>${esc((l.startedAt || "").slice(0, 16).replace("T", " "))}</td><td>${esc(tipo)}</td>
+      <td>${esc(l.notes || "")}</td><td>${l.recordsReceived ?? "—"}</td>
+      <td><span class="badge ${l.status === "completed" ? "st-green" : "st-orange"}">${esc(l.status)}</span>${errs.length ? ` · ${errs.length} error(es)` : ""}</td>
+    </tr>${abierto ? `<tr><td colspan="5"><div class="hint">Creadas: ${l.recordsCreated ?? 0} · Actualizadas: ${l.recordsUpdated ?? 0} · Sin cambios: ${l.recordsUnchanged ?? 0} · Con error: ${l.recordsFailed ?? 0}${errs.length ? "<br/>" + errs.map((e) => esc(`${e.field || e.externalId || ""}: ${e.message}`)).join("<br/>") : ""}</div></td></tr>` : ""}`;
+  }).join("");
+  return `<div class="panel">
+    <div class="panel-head"><h3>Historial de intercambios con ACQUA</h3></div>
+    <div class="hint" style="margin-bottom:8px">Click en una fila para ver el detalle.</div>
+    <table class="table"><thead><tr><th>Fecha</th><th>Tipo</th><th>Archivo / lote</th><th>Cantidad</th><th>Estado</th></tr></thead>
+    <tbody>${rowsHtml || `<tr><td colspan="5" class="muted">Todavía no hay importaciones ni exportaciones con ACQUA.</td></tr>`}</tbody></table>
+  </div>`;
+}
+
 async function boot() {
   state.route = parseHash();
   renderApp();

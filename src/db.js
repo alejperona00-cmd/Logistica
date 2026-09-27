@@ -6,7 +6,7 @@
    ========================================================================== */
 import { supabase } from "./supabaseClient.js";
 
-export const COLLECTIONS = ["locations", "customers", "suppliers", "transports", "routes", "inv_suppliers", "products", "inventory_lots", "stock_movements", "lot_locations", "app_settings", "box_configs", "box_config_items", "production_orders", "ldp_versions", "ldp_version_items", "manufacturing_orders", "production_reservations", "production_consumptions", "production_substitutions", "production_audit_log", "orders", "purchase_orders", "incidents", "tasks", "dispatch_details", "transport_rates", "transport_selections", "client_notifications", "logistics_zones", "integration_sync_logs", "integration_errors"];
+export const COLLECTIONS = ["locations", "customers", "suppliers", "transports", "routes", "inv_suppliers", "products", "inventory_lots", "stock_movements", "lot_locations", "app_settings", "box_configs", "box_config_items", "production_orders", "ldp_versions", "ldp_version_items", "manufacturing_orders", "production_reservations", "production_consumptions", "production_substitutions", "production_audit_log", "orders", "purchase_orders", "incidents", "tasks", "dispatch_details", "transport_rates", "transport_selections", "client_notifications", "logistics_zones", "integration_sync_logs", "integration_errors", "acqua_export_batches", "acqua_export_items"];
 
 const camelToSnake = (k) => k.replace(/[A-Z]/g, (m) => "_" + m.toLowerCase());
 const snakeToCamel = (k) => k.replace(/_([a-z0-9])/g, (_, c) => c.toUpperCase());
