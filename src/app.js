@@ -19,6 +19,7 @@ import { cameraScanSupported, detectDeviceLabel, openCameraScan } from "./domain
 import {
   ACQUA_COLUMN_DEFAULTS, ACQUA_EXPORT_COLUMNS, normalizeAcquaRow, parseAcquaImportRows,
   validateAcquaOfRow, buildAcquaExportRows, exportRowsToAOA, exportRowsToCsv, formatExportBatchId,
+  looksLikeAcquaPrintReport, parseAcquaPrintReportSheet, combineAcquaImportResults,
 } from "./integrations/acquaFileAdapter.js";
 
 /* ---------------------------------------------------------------------------
@@ -7088,26 +7089,46 @@ function bindGlobalEvents() {
     const acquaImportFile = e.target.closest("#acqua-import-file");
     if (acquaImportFile) {
       (async () => {
-        const file = acquaImportFile.files && acquaImportFile.files[0];
+        const files = acquaImportFile.files ? Array.from(acquaImportFile.files) : [];
         const preview = $("#acqua-import-preview");
         const confirmBtn = $("#acqua-import-confirm");
-        if (!file) return;
+        if (!files.length) return;
         if (confirmBtn) confirmBtn.disabled = true;
-        if (preview) preview.innerHTML = `<p class="hint">Leyendo archivo…</p>`;
+        if (preview) preview.innerHTML = `<p class="hint">Leyendo ${files.length > 1 ? `${files.length} archivos` : "archivo"}…</p>`;
         const cfgFile = acquaConfig();
         try {
-          let rawRows;
-          if (/\.csv$/i.test(file.name)) {
-            const text = await file.text();
-            const wb = XLSXStyle.read(text, { type: "string" });
-            rawRows = XLSXStyle.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval: "" });
-          } else {
-            const buf = await file.arrayBuffer();
-            const wb = XLSXStyle.read(buf, { type: "array" });
-            rawRows = XLSXStyle.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval: "" });
+          // Cada archivo puede ser el reporte impreso de UNA OF (formato real
+          // confirmado de ACQUA — ver claude/ACQUA_INTEGRATION_SPEC.md) o,
+          // si en algún momento ACQUA agrega esa exportación, una tabla
+          // clásica con varias OF. Se detecta archivo por archivo — nunca se
+          // asume uno solo para toda la selección.
+          const perFileResults = [];
+          for (const file of files) {
+            let rawAoa, rawRowsObj;
+            if (/\.csv$/i.test(file.name)) {
+              const text = await file.text();
+              const wb = XLSXStyle.read(text, { type: "string" });
+              const ws = wb.Sheets[wb.SheetNames[0]];
+              rawAoa = XLSXStyle.utils.sheet_to_json(ws, { header: 1, defval: "" });
+              rawRowsObj = XLSXStyle.utils.sheet_to_json(ws, { defval: "" });
+            } else {
+              const buf = await file.arrayBuffer();
+              const wb = XLSXStyle.read(buf, { type: "array" });
+              const ws = wb.Sheets[wb.SheetNames[0]];
+              rawAoa = XLSXStyle.utils.sheet_to_json(ws, { header: 1, defval: "" });
+              rawRowsObj = XLSXStyle.utils.sheet_to_json(ws, { defval: "" });
+            }
+            if (looksLikeAcquaPrintReport(rawAoa)) {
+              const { ofRow, errors } = parseAcquaPrintReportSheet(rawAoa, file.name);
+              perFileResults.push({ ofRows: ofRow ? [ofRow] : [], errors });
+            } else {
+              const { ofRows, errors } = parseAcquaImportRows(rawRowsObj, cfgFile.columnMapping);
+              perFileResults.push({ ofRows, errors: errors.map((er) => ({ ...er, fila: `${file.name} · fila ${er.fila}` })) });
+            }
           }
-          const { ofRows, errors } = parseAcquaImportRows(rawRows, cfgFile.columnMapping);
-          acquaImportParsed = { ofRows, errors, fileName: file.name };
+          const { ofRows, errors } = combineAcquaImportResults(perFileResults);
+          const fileName = files.length === 1 ? files[0].name : `${files.length} archivos (${files.map((f) => f.name).join(", ")})`;
+          acquaImportParsed = { ofRows, errors, fileName, fileNames: files.map((f) => f.name) };
           acquaImportDecisions = {};
           if (preview) preview.innerHTML = acquaImportPreviewHTML(acquaImportParsed, cfgFile);
           if (confirmBtn) confirmBtn.disabled = ofRows.length === 0;
@@ -8395,7 +8416,8 @@ function acquaImportPreviewHTML(parsed, cfg) {
       situacion = `<span class="badge st-green">Nueva</span>`;
     }
     return `<tr>
-      <td>${esc(row.externalOfId)}</td><td>${esc(row.numero || "—")}</td><td>${esc(row.productoCodigo || row.productoNombre || "—")}</td>
+      <td>${esc(row.externalOfId)}</td><td>${esc(row.productoCodigo || row.productoNombre || "—")}</td>
+      <td>${esc(row.clienteNombre || row.clienteCodigo || "—")}</td>
       <td>${esc(String(row.cantidadPlanificada ?? "—"))}</td><td>${situacion}</td><td>${detalle}</td>
     </tr>`;
   }).join("");
@@ -8407,9 +8429,9 @@ function acquaImportPreviewHTML(parsed, cfg) {
       <div class="stat-box"><b>${conError + errors.length}</b><span>Con error</span></div>
     </div>
     ${bloqueadas ? `<div class="hint" style="margin-top:8px;color:var(--danger)">${bloqueadas} OF ya está en curso en Logística Perona (reservada/en producción) — no se puede actualizar por import, queda ignorada.</div>` : ""}
-    ${errors.length ? `<div class="hint" style="margin-top:8px;color:var(--danger)">${errors.length} fila(s) del archivo no forman una OF válida: ${errors.slice(0, 5).map((e) => `fila ${e.fila} (${esc(e.message)})`).join("; ")}${errors.length > 5 ? "…" : ""}</div>` : ""}
-    <table class="table" style="margin-top:10px"><thead><tr><th>ID ACQUA</th><th>Número</th><th>Producto</th><th>Cantidad</th><th>Situación</th><th>Detalle / decisión</th></tr></thead><tbody>${rowsHtml || `<tr><td colspan="6" class="muted">Sin OF válidas en el archivo.</td></tr>`}</tbody></table>
-    <div class="hint" style="margin-top:8px">Archivo: ${esc(fileName)}</div>
+    ${errors.length ? `<div class="hint" style="margin-top:8px;color:var(--danger)">${errors.length} fila(s)/archivo(s) no forman una OF válida: ${errors.slice(0, 5).map((e) => `${e.fila} (${esc(e.message)})`).join("; ")}${errors.length > 5 ? "…" : ""}</div>` : ""}
+    <table class="table" style="margin-top:10px"><thead><tr><th>OF (ACQUA)</th><th>Producto</th><th>Cliente</th><th>Cantidad</th><th>Situación</th><th>Detalle / decisión</th></tr></thead><tbody>${rowsHtml || `<tr><td colspan="6" class="muted">Sin OF válidas en los archivos seleccionados.</td></tr>`}</tbody></table>
+    <div class="hint" style="margin-top:8px">Archivo${(parsed.fileNames && parsed.fileNames.length > 1) ? "s" : ""}: ${esc(fileName)}</div>
   `;
 }
 
@@ -8417,8 +8439,8 @@ function viewAcquaImportar() {
   const cfg = acquaConfig();
   return `<div class="panel">
     <div class="panel-head"><h3>Importar OF desde ACQUA</h3></div>
-    <div class="hint" style="margin-bottom:10px">Subí el archivo que exporta ACQUA con las Órdenes de Fabricación (formato configurado: <b>${esc(cfg.formatoImportacion.toUpperCase())}</b> — cambiable en Configuración). Cada producto de ACQUA necesita una configuración de caja (LDP) mapeada en Configuración → Integración ACQUA antes de poder importarse: nunca se adivina esa relación. Una OF ya importada antes no se pisa sola — se te pregunta qué hacer.</div>
-    <input type="file" id="acqua-import-file" accept=".xlsx,.xls,.csv" class="input" />
+    <div class="hint" style="margin-bottom:10px">ACQUA exporta la OF como el reporte impreso de esa orden (un archivo por OF, no una lista) — podés seleccionar <b>varios archivos a la vez</b>, uno por cada OF que quieras importar. También se acepta el formato tabular clásico (${esc(cfg.formatoImportacion.toUpperCase())}, varias OF en un mismo archivo) si en algún momento ACQUA ofrece esa exportación. Cada producto de ACQUA necesita una configuración de caja (LDP) mapeada en Configuración → Integración ACQUA antes de poder importarse: nunca se adivina esa relación. Una OF ya importada antes no se pisa sola — se te pregunta qué hacer.</div>
+    <input type="file" id="acqua-import-file" accept=".xlsx,.xls,.csv" class="input" multiple />
     <div id="acqua-import-preview" style="margin-top:12px">${acquaImportParsed ? acquaImportPreviewHTML(acquaImportParsed, cfg) : ""}</div>
     <div class="form-actions">
       <button type="button" class="btn btn-primary" id="acqua-import-confirm" ${(!acquaImportParsed || !acquaImportParsed.ofRows.length) ? "disabled" : ""}>Confirmar importación</button>
@@ -8442,6 +8464,31 @@ async function runAcquaImport(parsed, cfg, fileName) {
       const rowErrors = validateAcquaOfRow(row, cfg);
       if (rowErrors.length) throw new Error(rowErrors.join("; "));
       const boxConfigId = cfg.productoLdpMap[row.productoCodigo];
+      const acquaItemsRaw = (row.itemsRaw && row.itemsRaw.length) || (row.fichaTecnicaRaw && row.fichaTecnicaRaw.length)
+        ? { componentes: row.itemsRaw || [], fichaTecnica: row.fichaTecnicaRaw || [] }
+        : null;
+      const notasPartes = [`Importada de ACQUA (OF ${row.externalOfId}).`];
+      if (row.clienteNombre || row.clienteCodigo) notasPartes.push(`Cliente ACQUA: ${[row.clienteCodigo, row.clienteNombre].filter(Boolean).join(" - ")}.`);
+      if (row.depositoDestino) notasPartes.push(`Depósito destino ACQUA: ${row.depositoDestino}.`);
+      if (row.vendedor) notasPartes.push(`Vendedor: ${row.vendedor}.`);
+      if (row.fichaTecnicaRaw && row.fichaTecnicaRaw.length) notasPartes.push(`Tiene ficha técnica de personalización — ver detalle importado (acquaItemsRaw) en la OF.`);
+      const notes = notasPartes.join(" ");
+
+      // Cliente: se matchea por nombre igual que ya hace la importación de
+      // pedidos desde Excel; si no existe, se crea sin ubicación (ACQUA no
+      // manda dirección) — nunca se inventa una dirección ni se fuerza un
+      // cliente existente que no coincide por nombre.
+      let customerId = null;
+      if (row.clienteNombre) {
+        const match = state.customers.find((c) => stripAccentsLower(c.name) === stripAccentsLower(row.clienteNombre));
+        if (match) customerId = match.id;
+        else {
+          const created2 = { id: uid("cus"), name: row.clienteNombre, phone: "", locationId: null, notes: `Creado automáticamente al importar OF de ACQUA (código de cliente ACQUA: ${row.clienteCodigo || "—"}). Sin ubicación — completar dirección si corresponde.` };
+          await persist("customers", created2);
+          customerId = created2.id;
+        }
+      }
+
       const existing = acquaMatchExisting(row.externalOfId);
       if (existing) {
         const decision = acquaImportDecisions[row.externalOfId] || "actualizar";
@@ -8451,22 +8498,24 @@ async function runAcquaImport(parsed, cfg, fileName) {
           cantidadPlanificada: parseFloat(row.cantidadPlanificada) || existing.cantidadPlanificada,
           fechaPlanificacion: row.fechaPlanificacion || existing.fechaPlanificacion,
           prioridad: acquaPrioridadDesde(row.prioridad) || existing.prioridad,
+          customerId: customerId || existing.customerId, customerName: row.clienteNombre || existing.customerName,
           acquaEstadoOrigen: row.estadoOrigen || null, acquaProductoCodigo: row.productoCodigo || null,
-          acquaProductoEan13: row.ean13 || null, acquaItemsRaw: row.itemsRaw && row.itemsRaw.length ? row.itemsRaw : null,
+          acquaProductoEan13: row.ean13 || null, acquaItemsRaw,
           sourceFile: fileName, importedAt: nowISO(), importVersion: (existing.importVersion || 1) + 1,
+          notes: existing.notes ? `${existing.notes}\n${notes}` : notes,
         });
         updated++;
       } else {
         const of = await createManufacturingOrder({
           boxConfigId, cantidadPlanificada: parseFloat(row.cantidadPlanificada) || 0,
           fechaPlanificacion: row.fechaPlanificacion || null, prioridad: acquaPrioridadDesde(row.prioridad),
-          notes: `Importada de ACQUA (ID ${row.externalOfId}${row.numero ? ", " + row.numero : ""}).`,
+          customerId, notes,
         });
         await persist("manufacturing_orders", {
           ...of, externalSystem: "ACQUA", externalOfId: row.externalOfId, sourceFile: fileName,
           importedAt: nowISO(), importVersion: 1, acquaEstadoOrigen: row.estadoOrigen || null,
           acquaProductoCodigo: row.productoCodigo || null, acquaProductoEan13: row.ean13 || null,
-          acquaItemsRaw: row.itemsRaw && row.itemsRaw.length ? row.itemsRaw : null,
+          acquaItemsRaw,
         });
         created++;
       }
@@ -8493,22 +8542,34 @@ async function runAcquaImport(parsed, cfg, fileName) {
  * configurado) para probar todo el circuito ACQUA → archivo → Logística
  * Perona → ejecución → cierre → archivo de vuelta sin tocar ningún dato
  * real de ACQUA (sección 17 del pedido: modo demo/simulación). */
+/** Genera un archivo de demostración que reproduce el layout REAL del
+ * reporte de OF de ACQUA (confirmado con un archivo real exportado — ver
+ * claude/ACQUA_INTEGRATION_SPEC.md): etiquetas y valores en celdas sueltas,
+ * no una tabla con encabezados. Así "Importar OF" ejercita exactamente el
+ * mismo camino de parseo (parseAcquaPrintReportSheet) que se va a usar con
+ * archivos reales, sin tocar ningún dato real de ACQUA. */
 function generarArchivoDemoAcqua() {
   const cfg = acquaConfig();
-  const map = { ...ACQUA_COLUMN_DEFAULTS, ...cfg.columnMapping };
   const codigoDemo = Object.keys(cfg.productoLdpMap)[0] || "CAJA-DEMO";
   const idOfDemo = `DEMO-${Date.now()}`;
-  const row = {
-    [map.externalOfId]: idOfDemo, [map.numero]: "ACQ-DEMO-1", [map.fecha]: todayISO(),
-    [map.productoCodigo]: codigoDemo, [map.productoNombre]: "Producto de demostración ACQUA",
-    [map.cantidadPlanificada]: "10", [map.estadoOrigen]: "LIBERADA", [map.prioridad]: "NORMAL",
-  };
-  const headers = Object.keys(row);
-  const aoa = [headers, headers.map((h) => row[h])];
+  const aoa = [];
+  const put = (r, c, v) => { aoa[r] = aoa[r] || []; aoa[r][c] = v; };
+  put(3, 1, `OF: ${idOfDemo}`);
+  put(5, 1, "Producto:"); put(5, 15, `${codigoDemo} - Producto de demostración ACQUA`);
+  put(5, 26, "Estado:"); put(5, 28, "Confirmada");
+  put(6, 1, "Cliente:"); put(6, 15, "0000 - Cliente de demostración");
+  put(6, 26, "Cantidad a producir:"); put(6, 28, "10");
+  put(7, 1, "Fecha Planificada:"); put(7, 15, todayISO().split("-").reverse().join("/"));
+  put(7, 26, "Fecha/Hora Creación:"); put(7, 28, `${todayISO().split("-").reverse().join("/")} 00:00`);
+  put(9, 26, "Depósito destino:"); put(9, 28, "Depósito demo");
+  put(13, 1, "Código"); put(13, 11, "Producto");
+  put(12, 30, "Cantidad");
+  put(15, 1, "INS-DEMO-1"); put(15, 11, "Insumo de demostración"); put(15, 30, "1,00");
+  for (let r = 0; r < aoa.length; r++) if (!aoa[r]) aoa[r] = [];
   const wb = XLSXStyle.utils.book_new();
   const ws = XLSXStyle.utils.aoa_to_sheet(aoa);
-  XLSXStyle.utils.book_append_sheet(wb, ws, "DEMO_ACQUA");
-  const fileName = `acqua-demo-import-${todayISO()}.xlsx`;
+  XLSXStyle.utils.book_append_sheet(wb, ws, "mrp_production_order");
+  const fileName = `acqua-demo-of-${idOfDemo}.xlsx`;
   XLSXStyle.writeFile(wb, fileName);
   if (!Object.keys(cfg.productoLdpMap).length) {
     toast(`Archivo de demostración generado (${fileName}). Todavía no configuraste ningún mapeo Producto ACQUA → LDP en Configuración, así que al importarlo de prueba va a quedar marcado con error hasta que mapees al menos un código — es intencional, para no inventar esa relación.`, "warn");

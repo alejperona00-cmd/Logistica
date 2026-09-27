@@ -213,6 +213,225 @@ export function validateAcquaOfRow(ofRow, ctx = {}) {
 }
 
 // ---------------------------------------------------------------------------
+// IMPORTACIÓN — REPORTE IMPRESO INDIVIDUAL (formato REAL confirmado)
+// ---------------------------------------------------------------------------
+// A partir de un archivo real exportado por ACQUA (hoja "mrp_production_order"
+// — ACQUA corre sobre Odoo) se confirmó que la exportación de una OF NO es una
+// fila de una tabla: es el reporte impreso de UNA sola OF (como el PDF de
+// "Imprimir OF" guardado como Excel), con etiquetas y valores en celdas
+// sueltas dentro de un layout con muchas celdas combinadas, más una tabla
+// chica de componentes y una sección "FICHA TÉCNICA" de personalización.
+// Por eso "importar varias OF" significa elegir VARIOS archivos a la vez
+// (uno por OF), no un único archivo con muchas filas — ver combineAcquaImportResults.
+// Las funciones de abajo son la lectura de ESE formato real; el parser
+// tabular de arriba (parseAcquaImportRows) se conserva por si en el futuro
+// ACQUA agrega una exportación masiva distinta.
+
+const ACQUA_PRINT_REPORT_LABELS = {
+  of: /^OF\s*:/i,
+  producto: /^Producto\s*:/i,
+  cliente: /^Cliente\s*:/i,
+  fechaPlanificada: /^Fecha Planificada\s*:/i,
+  estado: /^Estado\s*:/i,
+  cantidadAProducir: /^Cantidad a producir\s*:/i,
+  fechaCreacion: /^Fecha\/?Hora Creaci[oó]n\s*:/i,
+  depositoDestino: /^Dep[oó]sito destino\s*:/i,
+  vendedor: /^Vendedor\s*:/i,
+  codigoHeader: /^C[oó]digo$/i,
+  productoHeader: /^Producto$/i,
+  cantidadHeader: /^Cantidad$/i,
+  fichaTecnica: /^FICHA T[EÉ]CNICA$/i,
+};
+
+/** ¿Esta hoja (ya leída como array-of-arrays, `sheet_to_json(ws,{header:1})`)
+ * es un reporte impreso de UNA OF de ACQUA, en vez de una tabla con
+ * encabezados en la fila 1? Se detecta por la celda "OF: <numero>" que
+ * encabeza siempre el reporte — si no aparece, se asume tabla plana. */
+export function looksLikeAcquaPrintReport(aoa) {
+  for (const row of (aoa || []).slice(0, 10)) {
+    for (const cell of row || []) {
+      if (typeof cell === "string" && ACQUA_PRINT_REPORT_LABELS.of.test(cell.trim())) return true;
+    }
+  }
+  return false;
+}
+
+function findLabelCell(aoa, regex, fromRow = 0, toRow = aoa.length) {
+  for (let r = fromRow; r < Math.min(toRow, aoa.length); r++) {
+    const row = aoa[r] || [];
+    for (let c = 0; c < row.length; c++) {
+      if (typeof row[c] === "string" && regex.test(row[c].trim())) return { r, c };
+    }
+  }
+  return null;
+}
+function valueRightOf(aoa, r, c) {
+  const row = aoa[r] || [];
+  for (let cc = c + 1; cc < row.length; cc++) {
+    const v = row[cc];
+    if (v !== undefined && v !== null && String(v).trim() !== "") return String(v).trim();
+  }
+  return "";
+}
+/** La 2da fecha de "Fecha Planificada" (rango Desde/Hasta) se imprime SIN
+ * etiqueta propia, en la fila siguiente — Odoo la muestra como dos líneas
+ * apiladas bajo la misma etiqueta. */
+function valueLoneBelow(aoa, r, cRef) {
+  const row = aoa[r + 1] || [];
+  for (let cc = Math.max(0, cRef - 3); cc < row.length; cc++) {
+    const v = row[cc];
+    if (v !== undefined && v !== null && String(v).trim() !== "") return String(v).trim();
+  }
+  return "";
+}
+function parseOdooDate(s) {
+  if (!s) return null;
+  const str = String(s).trim();
+  const dmy = str.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})/);
+  if (dmy) { const [, d, m, y] = dmy; return `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`; }
+  const iso = str.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  return iso ? iso[0].slice(0, 10) : null;
+}
+/** "0165 - ROOFTOP DEVLAB S.A.S" / "ESP-003296 - EMPRESAS - ROOFTOP MOCHILA"
+ * → separa sólo en el PRIMER " - " (el nombre puede tener guiones propios). */
+function splitCodeName(s) {
+  if (!s) return { codigo: "", nombre: "" };
+  const m = String(s).match(/^\s*(\S+)\s*-\s*(.+)$/);
+  if (!m) return { codigo: "", nombre: String(s).trim() };
+  return { codigo: m[1].trim(), nombre: m[2].trim() };
+}
+/** Odoo imprime cantidades con coma decimal ("1,00") — se normaliza a punto
+ * SOLO cuando el formato es inequívocamente decimal-con-coma, nunca se
+ * inventa un separador de miles. */
+function normalizeDecimal(s) {
+  if (s == null) return s;
+  const str = String(s).trim();
+  return /^\d+,\d+$/.test(str) ? str.replace(",", ".") : str;
+}
+
+/** Parsea UN archivo = UNA OF en el formato real de reporte impreso de
+ * ACQUA. Devuelve `{ ofRow, errors }` — nunca varias OF (para eso, ver
+ * combineAcquaImportResults con un archivo por cada llamada). La sección
+ * "FICHA TÉCNICA" (personalización: talle, material, forma de entrega, etc.)
+ * se guarda entera y sin interpretar en `ofRow.fichaTecnicaRaw` — son
+ * casilleros de un formulario impreso y no hay forma confiable de saber cuál
+ * está marcado sin inventar una convención; se deja como referencia para el
+ * operador, nunca se usa para calcular nada. */
+export function parseAcquaPrintReportSheet(aoa, sourceLabel) {
+  const L = ACQUA_PRINT_REPORT_LABELS;
+  const ofCell = findLabelCell(aoa, L.of);
+  if (!ofCell) {
+    return { ofRow: null, errors: [{ fila: sourceLabel || "archivo", message: 'No se encontró la etiqueta "OF:" — no parece un reporte de OF de ACQUA.' }] };
+  }
+  const externalOfId = String(aoa[ofCell.r][ofCell.c]).replace(L.of, "").trim();
+  if (!externalOfId) {
+    return { ofRow: null, errors: [{ fila: sourceLabel || "archivo", message: "La celda \"OF:\" no tiene número." }] };
+  }
+
+  const productoCell = findLabelCell(aoa, L.producto, ofCell.r);
+  const { codigo: productoCodigo, nombre: productoNombre } = splitCodeName(productoCell ? valueRightOf(aoa, productoCell.r, productoCell.c) : "");
+
+  const clienteCell = findLabelCell(aoa, L.cliente, ofCell.r);
+  const { codigo: clienteCodigo, nombre: clienteNombre } = splitCodeName(clienteCell ? valueRightOf(aoa, clienteCell.r, clienteCell.c) : "");
+
+  const fechaPlanCell = findLabelCell(aoa, L.fechaPlanificada, ofCell.r);
+  const fechaDesdeRaw = fechaPlanCell ? valueRightOf(aoa, fechaPlanCell.r, fechaPlanCell.c) : "";
+  const fechaHastaRaw = fechaPlanCell ? valueLoneBelow(aoa, fechaPlanCell.r, fechaPlanCell.c) : "";
+
+  const estadoCell = findLabelCell(aoa, L.estado, ofCell.r);
+  const estadoOrigen = estadoCell ? valueRightOf(aoa, estadoCell.r, estadoCell.c) : "";
+
+  const cantidadCell = findLabelCell(aoa, L.cantidadAProducir, ofCell.r);
+  const cantidadPlanificada = normalizeDecimal(cantidadCell ? valueRightOf(aoa, cantidadCell.r, cantidadCell.c) : "");
+
+  const fechaCreacionCell = findLabelCell(aoa, L.fechaCreacion, ofCell.r);
+  const fechaCreacion = parseOdooDate(fechaCreacionCell ? valueRightOf(aoa, fechaCreacionCell.r, fechaCreacionCell.c) : "");
+
+  const depositoCell = findLabelCell(aoa, L.depositoDestino, ofCell.r);
+  const depositoDestino = depositoCell ? valueRightOf(aoa, depositoCell.r, depositoCell.c) : "";
+
+  const vendedorCell = findLabelCell(aoa, L.vendedor, ofCell.r);
+  const vendedor = vendedorCell ? valueRightOf(aoa, vendedorCell.r, vendedorCell.c) : "";
+
+  // Tabla de componentes (informativa — nunca reemplaza la LDP interna).
+  const codigoHeaderCell = findLabelCell(aoa, L.codigoHeader, ofCell.r + 1);
+  const itemsRaw = [];
+  let fichaTecnicaRow = null;
+  if (codigoHeaderCell) {
+    const productoHeaderCell = findLabelCell(aoa, L.productoHeader, codigoHeaderCell.r, codigoHeaderCell.r + 1);
+    const cantidadHeaderCell = findLabelCell(aoa, L.cantidadHeader, Math.max(0, codigoHeaderCell.r - 2), codigoHeaderCell.r + 1);
+    const colCodigo = codigoHeaderCell.c;
+    const colProducto = productoHeaderCell ? productoHeaderCell.c : null;
+    const colCantidad = cantidadHeaderCell ? cantidadHeaderCell.c : null;
+    for (let r = codigoHeaderCell.r + 1; r < aoa.length; r++) {
+      const row = aoa[r] || [];
+      if (row.some((v) => typeof v === "string" && L.fichaTecnica.test(v.trim()))) { fichaTecnicaRow = r; break; }
+      const codigoVal = row[colCodigo];
+      if (codigoVal !== undefined && codigoVal !== null && String(codigoVal).trim() !== "") {
+        itemsRaw.push({
+          codigo: String(codigoVal).trim(),
+          nombre: colProducto != null ? String(row[colProducto] ?? "").trim() : "",
+          cantidad: colCantidad != null ? normalizeDecimal(String(row[colCantidad] ?? "").trim()) : "",
+        });
+      }
+    }
+  }
+
+  // FICHA TÉCNICA: se guarda cruda (fila, celda, valor) desde donde aparece
+  // la etiqueta hasta "Impreso:" (pie del reporte) o el final de la hoja —
+  // sin interpretar casilleros. Puramente informativo para el operador.
+  const fichaTecnicaRaw = [];
+  if (fichaTecnicaRow != null) {
+    for (let r = fichaTecnicaRow; r < aoa.length; r++) {
+      const row = aoa[r] || [];
+      if (row.some((v) => typeof v === "string" && /^Impreso\s*:/i.test(v.trim()))) break;
+      row.forEach((v, c) => {
+        if (typeof v === "string" && v.trim() !== "") fichaTecnicaRaw.push({ r, c, valor: v.trim() });
+      });
+    }
+  }
+
+  const ofRow = {
+    fila: sourceLabel || externalOfId,
+    externalOfId, numero: externalOfId,
+    fecha: parseOdooDate(fechaDesdeRaw), fechaRaw: fechaDesdeRaw,
+    fechaPlanificacion: parseOdooDate(fechaDesdeRaw),
+    fechaPlanificacionHasta: parseOdooDate(fechaHastaRaw),
+    fechaCreacion,
+    productoCodigo, productoNombre, ean13: null,
+    cantidadPlanificada, estadoOrigen: estadoOrigen || null,
+    prioridad: null,
+    clienteCodigo, clienteNombre,
+    depositoDestino: depositoDestino || null, vendedor: vendedor || null,
+    itemsRaw, fichaTecnicaRaw,
+  };
+  return { ofRow, errors: [] };
+}
+
+/** Junta los resultados de parsear varios archivos (uno por OF, formato real
+ * de reporte impreso — o una mezcla con archivos tabulares) en un único
+ * `{ ofRows, errors }`, con la MISMA detección de número de OF repetido que
+ * ya hace parseAcquaImportRows para un solo archivo, más la detección de un
+ * mismo ID_OF apareciendo en dos archivos distintos de la misma tanda. */
+export function combineAcquaImportResults(results) {
+  const ofRows = [];
+  const errors = [];
+  (results || []).forEach((res) => {
+    (res?.ofRows || []).forEach((r) => ofRows.push(r));
+    (res?.errors || []).forEach((e) => errors.push(e));
+  });
+  const numeroCount = new Map();
+  ofRows.forEach((r) => numeroCount.set(r.numero, (numeroCount.get(r.numero) || 0) + 1));
+  const extIdCount = new Map();
+  ofRows.forEach((r) => extIdCount.set(r.externalOfId, (extIdCount.get(r.externalOfId) || 0) + 1));
+  ofRows.forEach((r) => {
+    if (numeroCount.get(r.numero) > 1) errors.push({ fila: r.fila, message: `Número de OF "${r.numero}" repetido en la selección — revisar los archivos de origen.` });
+    else if (extIdCount.get(r.externalOfId) > 1) errors.push({ fila: r.fila, message: `La OF con ID "${r.externalOfId}" aparece repetida en la selección de archivos.` });
+  });
+  return { ofRows, errors };
+}
+
+// ---------------------------------------------------------------------------
 // EXPORTACIÓN
 // ---------------------------------------------------------------------------
 
